@@ -293,8 +293,8 @@ if (Test-Path $wtSettingsPath) {
         Copy-Item $wtSettingsPath $backupPath -Force
         Write-Host "  Backup saved to $backupPath" -ForegroundColor DarkGray
 
-        # Strip JSONC single-line comments before parsing — PS5's ConvertFrom-Json can't handle them
-        $wtRaw = (Get-Content $wtSettingsPath -Raw) -replace '(?m)(?<=^([^"]*"[^"]*")*[^"]*)\s*//.*$', ''
+        # Strip JSONC comments; use \x22 instead of " to avoid PS5 parser choking on [^"]
+        $wtRaw = (Get-Content $wtSettingsPath -Raw) -replace '(?m)(?<=^([^\x22]*\x22[^\x22]*\x22)*[^\x22]*)\s*//.*$', ''
         $wt = $wtRaw | ConvertFrom-Json
 
         # Set defaults (font, acrylic, cursor, padding)
@@ -307,8 +307,8 @@ if (Test-Path $wtSettingsPath) {
         $defaults | Add-Member -NotePropertyName "useAcrylic" -NotePropertyValue $true -Force
         # Explicit -ColorScheme param wins over config
         $cfgColorScheme = if ($PSBoundParameters.ContainsKey('ColorScheme')) { $ColorScheme }
-            elseif ($profileConfig -and $profileConfig.windowsTerminal.colorScheme) { $profileConfig.windowsTerminal.colorScheme }
-            else { $null }
+        elseif ($profileConfig -and $profileConfig.windowsTerminal.colorScheme) { $profileConfig.windowsTerminal.colorScheme }
+        else { $null }
         $cfgCursorColor = if ($profileConfig -and $profileConfig.windowsTerminal.cursorColor) { $profileConfig.windowsTerminal.cursorColor } else { $null }
         if ($cfgColorScheme) {
             $defaults | Add-Member -NotePropertyName "colorScheme" -NotePropertyValue $cfgColorScheme -Force

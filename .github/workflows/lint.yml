@@ -48,19 +48,18 @@ jobs:
             exit 1
           }
 
-      - name: Parse-check setup.ps1 and setprofile.ps1
-        shell: pwsh
+      - name: PS5 parse-check (all .ps1 files)
+        shell: powershell
         run: |
           $errors = 0
-          foreach ($file in @('setup.ps1', 'setprofile.ps1')) {
-            $path = Join-Path '${{ github.workspace }}' $file
+          Get-ChildItem -Path '${{ github.workspace }}' -Filter *.ps1 | ForEach-Object {
             $tokens = $null; $parseErrors = $null
-            [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$parseErrors) | Out-Null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$parseErrors) | Out-Null
             if ($parseErrors.Count -gt 0) {
-              $parseErrors | ForEach-Object { Write-Error "$file : $_" }
+              $parseErrors | ForEach-Object { Write-Error "$($_.FullName) : $_" }
               $errors++
             } else {
-              Write-Host "$file parsed OK." -ForegroundColor Green
+              Write-Host "$($_.Name) parsed OK." -ForegroundColor Green
             }
           }
           if ($errors -gt 0) { exit 1 }

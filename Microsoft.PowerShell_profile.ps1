@@ -201,7 +201,8 @@ function Update-Profile {
                         Copy-Item $wtSettingsPath $backupPath -Force
                         Write-Host "WT backup: $backupPath" -ForegroundColor DarkGray
 
-                        $wtRaw = (Get-Content $wtSettingsPath -Raw) -replace '(?m)(?<=^([^"]*"[^"]*")*[^"]*)\s*//.*$', ''
+                        # Strip JSONC comments; use \x22 instead of " to avoid PS5 parser choking on [^"]
+                        $wtRaw = (Get-Content $wtSettingsPath -Raw) -replace '(?m)(?<=^([^\x22]*\x22[^\x22]*\x22)*[^\x22]*)\s*//.*$', ''
                         $wt = $wtRaw | ConvertFrom-Json
 
                         if (-not $wt.profiles.defaults) {
