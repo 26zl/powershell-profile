@@ -1,0 +1,113 @@
+name: PSScriptAnalyzer
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.24.0 -Force -Scope CurrentUser
+
+      - name: Run PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -ExcludeRule @(
+            'PSAvoidUsingWriteHost'              # Profile needs colored console output
+            'PSAvoidUsingWMICmdlet'               # PS5 compatibility path in uptime
+            'PSUseShouldProcessForStateChangingFunctions'  # Overkill for a profile
+            'PSUseBOMForUnicodeEncodedFile'       # Not needed
+            'PSReviewUnusedParameter'             # Scriptblock params required by completer API
+            'PSUseSingularNouns'                  # Style preference
+          )
+          $results | Format-Table -AutoSize
+          if ($results | Where-Object Severity -in 'Error','Warning') {
+            Write-Error "PSScriptAnalyzer found warnings or errors"
+            exit 1
+          }
+
+      - name: Smoke-test profile (non-interactive)
+        shell: pwsh
+        run: |
+          $env:CI = 'true'
+          try {
+            pwsh -NonInteractive -NoProfile -Command ". '${{ github.workspace }}/Microsoft.PowerShell_profile.ps1'"
+            Write-Host "Profile loaded successfully in non-interactive mode." -ForegroundColor Green
+          } catch {
+            Write-Error "Profile failed to load non-interactive: $_"
+            exit 1
+          }
+
+      - name: Check for hardcoded paths
+        shell: pwsh
+        run: |
+          $patterns = @(
+            'C:\\Users\\'
+            'C:/Users/'
+            '/home/'
+            '\\\\Users\\\\'
+          )
+          $files = Get-ChildItem -Recurse -Include *.ps1,*.md,*.yml | Where-Object { $_.FullName -notlike '*\.git\*' -and $_.FullName -notlike '*\.github\workflows\*' }
+          $found = @()
+          foreach ($file in $files) {
+            $lines = Get-Content $file.FullName -ErrorAction SilentlyContinue
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              foreach ($pattern in $patterns) {
+                if ($lines[$i] -match [regex]::Escape($pattern)) {
+                  $found += [PSCustomObject]@{
+                    File = $file.Name
+                    Line = $i + 1
+                    Match = $lines[$i].Trim()
+                  }
+                }
+              }
+            }
+          }
+          if ($found) {
+            $found | Format-Table -AutoSize
+            Write-Error "Hardcoded user paths found"
+            exit 1
+          }
+          Write-Host "No hardcoded paths found." -ForegroundColor Green
+
+      - name: Check for secrets
+        shell: pwsh
+        run: |
+          $patterns = @(
+            '(?i)(api[_-]?key|apikey)\s*[:=]\s*[''"][A-Za-z0-9+/=]{16,}[''"]'
+            '(?i)(secret|token|password)\s*[:=]\s*[''"][^''"]{8,}[''"]'
+            '(?i)(aws_access_key_id|aws_secret_access_key)\s*[:=]'
+            'ghp_[A-Za-z0-9]{36}'
+            'sk-[A-Za-z0-9]{32,}'
+            '(?i)connectionstring\s*[:=]\s*[''"]Server='
+          )
+          $files = Get-ChildItem -Recurse -Include *.ps1,*.md,*.yml,*.json | Where-Object { $_.FullName -notlike '*\.git\*' }
+          $found = @()
+          foreach ($file in $files) {
+            $content = Get-Content $file.FullName -Raw -ErrorAction SilentlyContinue
+            if (-not $content) { continue }
+            foreach ($pattern in $patterns) {
+              if ($content -match $pattern) {
+                $found += [PSCustomObject]@{
+                  File = $file.Name
+                  Pattern = $pattern.Substring(0, [Math]::Min(40, $pattern.Length)) + '...'
+                }
+              }
+            }
+          }
+          if ($found) {
+            $found | Format-Table -AutoSize
+            Write-Error "Potential secrets found"
+            exit 1
+          }
+          Write-Host "No secrets found." -ForegroundColor Green
