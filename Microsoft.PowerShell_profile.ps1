@@ -53,11 +53,20 @@ function Update-Profile {
         }
 
         # Phase 2: Hash verification (profile .ps1 only)
-        $oldHash = (Get-FileHash -Path $PROFILE -Algorithm SHA256).Hash
+        $oldHash = if (Test-Path $PROFILE) { (Get-FileHash -Path $PROFILE -Algorithm SHA256).Hash } else { "" }
         $newHash = (Get-FileHash -Path $tempProfile -Algorithm SHA256).Hash
         $profileChanged = $newHash -ne $oldHash
 
-        if (-not $profileChanged -and -not $configDownloaded) {
+        # Check if config actually changed
+        $configChanged = $false
+        $cachedConfig = Join-Path $cacheDir "profile-config.json"
+        if ($configDownloaded) {
+            $newConfigHash = (Get-FileHash -Path $tempConfig -Algorithm SHA256).Hash
+            $oldConfigHash = if (Test-Path $cachedConfig) { (Get-FileHash -Path $cachedConfig -Algorithm SHA256).Hash } else { "" }
+            $configChanged = $newConfigHash -ne $oldConfigHash
+        }
+
+        if (-not $profileChanged -and -not $configChanged) {
             Write-Host "Profile is up to date." -ForegroundColor Green
             return
         }
@@ -110,8 +119,7 @@ function Update-Profile {
         }
 
         # Save config to cache dir for runtime use
-        if ($configDownloaded) {
-            $cachedConfig = Join-Path $cacheDir "profile-config.json"
+        if ($configChanged) {
             if ($PSCmdlet.ShouldProcess($cachedConfig, "Save profile-config.json to cache")) {
                 Copy-Item -Path $tempConfig -Destination $cachedConfig -Force
             }
@@ -134,7 +142,7 @@ function Update-Profile {
             $themeName = $config.theme.name
             $themeUrl = $config.theme.url
             $localThemePath = Join-Path $cacheDir "$themeName.omp.json"
-            $shouldDownloadTheme = (-not (Test-Path $localThemePath)) -or $profileChanged
+            $shouldDownloadTheme = (-not (Test-Path $localThemePath)) -or $profileChanged -or $configChanged
             if ($shouldDownloadTheme -and $themeUrl) {
                 if ($PSCmdlet.ShouldProcess($localThemePath, "Download OMP theme '$themeName'")) {
                     try {
@@ -177,8 +185,8 @@ function Update-Profile {
             }
         }
 
-        # Phase 7: Windows Terminal sync
-        if ($config -and $config.windowsTerminal) {
+        # Phase 7: Windows Terminal sync (only when config changed)
+        if ($configChanged -and $config -and $config.windowsTerminal) {
             $wtSettingsPath = Join-Path $env:LOCALAPPDATA "Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json"
             if (Test-Path $wtSettingsPath) {
                 if ($PSCmdlet.ShouldProcess($wtSettingsPath, "Update Windows Terminal colorScheme/cursorColor and sync scheme")) {
@@ -803,7 +811,7 @@ if ($isInteractive) {
             catch { Write-Verbose "Failed to parse profile-config.json: $_" }
         }
         if (-not $themeName) {
-            Write-Warning "No profile-config.json found in cache. Run Update-Profile or setup.ps1 to configure the OMP theme."
+            Write-Verbose "No profile-config.json found in cache. Run Update-Profile or setup.ps1 to configure the OMP theme."
         }
         $localThemePath = if ($themeName) { Join-Path $cacheDir "$themeName.omp.json" } else { $null }
         if ($localThemePath -and -not (Test-Path $localThemePath)) {
