@@ -48,6 +48,23 @@ jobs:
             exit 1
           }
 
+      - name: Parse-check setup.ps1 and setprofile.ps1
+        shell: pwsh
+        run: |
+          $errors = 0
+          foreach ($file in @('setup.ps1', 'setprofile.ps1')) {
+            $path = Join-Path '${{ github.workspace }}' $file
+            $tokens = $null; $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$parseErrors) | Out-Null
+            if ($parseErrors.Count -gt 0) {
+              $parseErrors | ForEach-Object { Write-Error "$file : $_" }
+              $errors++
+            } else {
+              Write-Host "$file parsed OK." -ForegroundColor Green
+            }
+          }
+          if ($errors -gt 0) { exit 1 }
+
       - name: Check for hardcoded paths
         shell: pwsh
         run: |

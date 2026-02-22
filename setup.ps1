@@ -40,11 +40,11 @@ if ($machinePolicy -in @('Restricted', 'AllSigned', 'Undefined')) {
 # Function to test internet connectivity (HTTPS — works through corporate proxies/firewalls)
 function Test-InternetConnection {
     try {
-        $response = Invoke-WebRequest -Uri "https://dns.google/resolve?name=github.com" -Method Head -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+        $response = Invoke-WebRequest -Uri "https://github.com" -Method Head -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
         return $response.StatusCode -eq 200
     }
     catch {
-        Write-Host "Internet connection is required but not available." -ForegroundColor Red
+        Write-Host "Internet connection is required but not available (cannot reach github.com)." -ForegroundColor Red
         return $false
     }
 }
@@ -149,12 +149,15 @@ foreach ($dir in $profileDirs) {
         if (!(Test-Path -Path $dir)) {
             New-Item -Path $dir -ItemType "directory" -Force | Out-Null
         }
+        # Download to temp first so a partial/corrupt download never overwrites the existing profile
+        $tempDownload = Join-Path $env:TEMP "profile_download_$(Split-Path $dir -Leaf).ps1"
+        Invoke-RestMethod $profileUrl -OutFile $tempDownload -TimeoutSec 30 -ErrorAction Stop
         if (Test-Path -Path $targetProfile -PathType Leaf) {
             $backupPath = Join-Path $dir "oldprofile.ps1"
-            Move-Item -Path $targetProfile -Destination $backupPath -Force
+            Copy-Item -Path $targetProfile -Destination $backupPath -Force
             Write-Host "  Backup saved to [$backupPath]" -ForegroundColor DarkGray
         }
-        Invoke-RestMethod $profileUrl -OutFile $targetProfile -TimeoutSec 30
+        Move-Item -Path $tempDownload -Destination $targetProfile -Force
         Write-Host "  Profile installed at [$targetProfile]" -ForegroundColor Green
 
         # Create starter user override file if it doesn't exist (never overwrite)
@@ -185,6 +188,7 @@ foreach ($dir in $profileDirs) {
     }
     catch {
         Write-Host "  Failed to install profile at [$targetProfile]: $_" -ForegroundColor Red
+        Remove-Item $tempDownload -ErrorAction SilentlyContinue
         $profileInstalled = $false
     }
 }
