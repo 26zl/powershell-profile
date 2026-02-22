@@ -119,7 +119,7 @@ function Update-Profile {
                     Write-Warning "Profile updated partially. Failed to write: $($copyFailed -join ', ')"
                 }
                 else {
-                    Write-Warning "Profile not updated — no writable profile directories found."
+                    Write-Warning "Profile not updated -- no writable profile directories found."
                 }
             }
         }
