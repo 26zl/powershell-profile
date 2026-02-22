@@ -19,6 +19,11 @@ $repo_root = "https://raw.githubusercontent.com/26zl"
 $cacheDir = Join-Path $env:LOCALAPPDATA "PowerShellProfile"
 if (-not (Test-Path $cacheDir)) { New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null }
 
+# JSONC comment-stripping regex (here-string avoids PS5 parser bug with [^"] in strings)
+$jsoncCommentPattern = @'
+(?m)(?<=^([^"]*"[^"]*")*[^"]*)\s*//.*$
+'@
+
 # Opt-out of telemetry if running as admin (only set once)
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($isAdmin -and -not [System.Environment]::GetEnvironmentVariable('POWERSHELL_TELEMETRY_OPTOUT', 'Machine')) {
@@ -201,8 +206,7 @@ function Update-Profile {
                         Copy-Item $wtSettingsPath $backupPath -Force
                         Write-Host "WT backup: $backupPath" -ForegroundColor DarkGray
 
-                        # Strip JSONC comments; use \x22 instead of " to avoid PS5 parser choking on [^"]
-                        $wtRaw = (Get-Content $wtSettingsPath -Raw) -replace '(?m)(?<=^([^\x22]*\x22[^\x22]*\x22)*[^\x22]*)\s*//.*$', ''
+                        $wtRaw = (Get-Content $wtSettingsPath -Raw) -replace $jsoncCommentPattern, ''
                         $wt = $wtRaw | ConvertFrom-Json
 
                         if (-not $wt.profiles.defaults) {

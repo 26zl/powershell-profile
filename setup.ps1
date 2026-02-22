@@ -103,6 +103,11 @@ if (-not (Test-InternetConnection)) {
     return
 }
 
+# JSONC comment-stripping regex (here-string avoids PS5 parser bug with [^"] in strings)
+$jsoncCommentPattern = @'
+(?m)(?<=^([^"]*"[^"]*")*[^"]*)\s*//.*$
+'@
+
 # Download profile-config.json (single source of truth for theme + WT metadata)
 $profileConfig = $null
 $configCachePath = Join-Path $env:LOCALAPPDATA "PowerShellProfile"
@@ -293,8 +298,7 @@ if (Test-Path $wtSettingsPath) {
         Copy-Item $wtSettingsPath $backupPath -Force
         Write-Host "  Backup saved to $backupPath" -ForegroundColor DarkGray
 
-        # Strip JSONC comments; use \x22 instead of " to avoid PS5 parser choking on [^"]
-        $wtRaw = (Get-Content $wtSettingsPath -Raw) -replace '(?m)(?<=^([^\x22]*\x22[^\x22]*\x22)*[^\x22]*)\s*//.*$', ''
+        $wtRaw = (Get-Content $wtSettingsPath -Raw) -replace $jsoncCommentPattern, ''
         $wt = $wtRaw | ConvertFrom-Json
 
         # Set defaults (font, acrylic, cursor, padding)
