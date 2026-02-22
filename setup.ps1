@@ -235,6 +235,9 @@ else {
     Write-Host "  Skipped theme download (profile-config.json missing or incomplete)." -ForegroundColor Yellow
     $themeInstalled = $true  # skip is not a failure
 }
+# Invalidate cached init scripts so they regenerate with correct paths on next startup
+Remove-Item (Join-Path $configCachePath "omp-init.ps1") -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $configCachePath "zoxide-init.ps1") -ErrorAction SilentlyContinue
 
 # Font Install
 Write-Host "[3/6] Nerd Fonts" -ForegroundColor Cyan
@@ -321,7 +324,7 @@ if (Test-Path $wtSettingsPath) {
             if (-not $wt.schemes) {
                 $wt | Add-Member -NotePropertyName "schemes" -NotePropertyValue @() -Force
             }
-            $wt.schemes = @($wt.schemes | Where-Object { $_.name -ne $schemeDef.name }) + $schemeDef
+            $wt.schemes = @(@($wt.schemes | Where-Object { $_ -and $_.name -ne $schemeDef.name }) + $schemeDef)
         }
 
         # Ensure PowerShell profiles launch with -NoLogo to suppress

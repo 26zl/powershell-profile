@@ -93,12 +93,14 @@ function Update-Profile {
                     Join-Path $docsRoot "PowerShell"
                     Join-Path $docsRoot "WindowsPowerShell"
                 )
+                $copySuccess = 0
                 $copyFailed = @()
                 foreach ($dir in $profileDirs) {
                     $target = Join-Path $dir "Microsoft.PowerShell_profile.ps1"
                     if (Test-Path $dir) {
                         try {
                             Copy-Item -Path $tempProfile -Destination $target -Force -ErrorAction Stop
+                            $copySuccess++
                         }
                         catch {
                             $copyFailed += $target
@@ -106,16 +108,19 @@ function Update-Profile {
                         }
                     }
                 }
-                if ($copyFailed.Count -eq 0) {
-                    Write-Host "Profile updated." -ForegroundColor Green
+                if ($copySuccess -gt 0 -and $copyFailed.Count -eq 0) {
+                    Write-Host "Profile updated ($copySuccess locations)." -ForegroundColor Green
+                }
+                elseif ($copySuccess -gt 0) {
+                    Write-Warning "Profile updated partially. Failed to write: $($copyFailed -join ', ')"
                 }
                 else {
-                    Write-Warning "Profile updated partially. Failed to write: $($copyFailed -join ', ')"
+                    Write-Warning "Profile not updated — no writable profile directories found."
                 }
             }
         }
         else {
-            Write-Host "Profile is up to date." -ForegroundColor Green
+            Write-Host "Profile .ps1 unchanged, applying config updates..." -ForegroundColor Cyan
         }
 
         # Save config to cache dir for runtime use
@@ -167,8 +172,8 @@ function Update-Profile {
             }
         }
 
-        # Phase 5: Cache invalidation (if profile changed)
-        if ($profileChanged) {
+        # Phase 5: Cache invalidation (if profile or config changed)
+        if ($profileChanged -or $configChanged) {
             $ompCache = Join-Path $cacheDir "omp-init.ps1"
             $zoxideCache = Join-Path $cacheDir "zoxide-init.ps1"
             if (Test-Path $ompCache) {
@@ -220,7 +225,7 @@ function Update-Profile {
                                 $wt | Add-Member -NotePropertyName "schemes" -NotePropertyValue @() -Force
                             }
                             $schemeDefName = if ($schemeDef.name) { $schemeDef.name } else { $schemeName }
-                            $wt.schemes = @($wt.schemes | Where-Object { $_.name -ne $schemeDefName }) + ([PSCustomObject]$schemeDef)
+                            $wt.schemes = @(@($wt.schemes | Where-Object { $_ -and $_.name -ne $schemeDefName }) + ([PSCustomObject]$schemeDef))
                         }
 
                         $wt | ConvertTo-Json -Depth 10 | Set-Content $wtSettingsPath -Encoding UTF8
@@ -842,8 +847,13 @@ if ($isInteractive) {
             }
             if (-not $cacheValid) {
                 $initScript = oh-my-posh init pwsh --config $localThemePath
-                "# OMP_CACHE_VERSION: $ompVersion" | Set-Content $ompCachePath -Encoding UTF8
-                $initScript | Add-Content $ompCachePath -Encoding UTF8
+                if ($initScript) {
+                    "# OMP_CACHE_VERSION: $ompVersion" | Set-Content $ompCachePath -Encoding UTF8
+                    $initScript | Add-Content $ompCachePath -Encoding UTF8
+                }
+                else {
+                    Write-Warning "oh-my-posh init produced no output. Cache not written."
+                }
             }
             try {
                 . $ompCachePath
@@ -852,9 +862,14 @@ if ($isInteractive) {
                 Remove-Item $ompCachePath -Force -ErrorAction SilentlyContinue
                 try {
                     $initScript = oh-my-posh init pwsh --config $localThemePath
-                    "# OMP_CACHE_VERSION: $ompVersion" | Set-Content $ompCachePath -Encoding UTF8
-                    $initScript | Add-Content $ompCachePath -Encoding UTF8
-                    . $ompCachePath
+                    if ($initScript) {
+                        "# OMP_CACHE_VERSION: $ompVersion" | Set-Content $ompCachePath -Encoding UTF8
+                        $initScript | Add-Content $ompCachePath -Encoding UTF8
+                        . $ompCachePath
+                    }
+                    else {
+                        Write-Warning "oh-my-posh init produced no output."
+                    }
                 }
                 catch {
                     Write-Warning "Failed to initialize oh-my-posh: $_"
