@@ -103,10 +103,9 @@ if (-not (Test-InternetConnection)) {
     return
 }
 
-# JSONC comment-stripping regex (here-string avoids PS5 parser bug with [^"] in strings)
-$jsoncCommentPattern = @'
-(?m)(?<=^([^"]*"[^"]*")*[^"]*)\s*//.*$
-'@
+# JSONC comment-stripping regex (built via variable to avoid PS5 parser bug with [^"] in strings)
+$_q = [char]34
+$jsoncCommentPattern = "(?m)(?<=^([^$_q]*$_q[^$_q]*$_q)*[^$_q]*)\s*//.*`$"
 
 # Download profile-config.json (single source of truth for theme + WT metadata)
 $profileConfig = $null

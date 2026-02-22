@@ -19,10 +19,9 @@ $repo_root = "https://raw.githubusercontent.com/26zl"
 $cacheDir = Join-Path $env:LOCALAPPDATA "PowerShellProfile"
 if (-not (Test-Path $cacheDir)) { New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null }
 
-# JSONC comment-stripping regex (here-string avoids PS5 parser bug with [^"] in strings)
-$jsoncCommentPattern = @'
-(?m)(?<=^([^"]*"[^"]*")*[^"]*)\s*//.*$
-'@
+# JSONC comment-stripping regex (built via variable to avoid PS5 parser bug with [^"] in strings)
+$_q = [char]34
+$jsoncCommentPattern = "(?m)(?<=^([^$_q]*$_q[^$_q]*$_q)*[^$_q]*)\s*//.*`$"
 
 # Opt-out of telemetry if running as admin (only set once)
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
