@@ -1204,6 +1204,87 @@ function b64d {
     catch { Write-Error "Invalid Base64 input: $_" }
 }
 
+function vt {
+    param([Parameter(Mandatory)][string]$FilePath)
+    if (-not $env:VT_API_KEY) {
+        Write-Host 'Set $env:VT_API_KEY first (free key at https://www.virustotal.com/gui/my-apikey)' -ForegroundColor Red
+        return
+    }
+    $resolved = Resolve-Path $FilePath -ErrorAction SilentlyContinue
+    if (-not $resolved) { Write-Error "File not found: $FilePath"; return }
+    $file = Get-Item $resolved
+    $sizeMB = [math]::Round($file.Length / 1MB, 2)
+    if ($file.Length -gt 32MB) {
+        Write-Error "File too large ($sizeMB MB). VirusTotal free limit is 32 MB."
+        return
+    }
+    $sha = (Get-FileHash $resolved -Algorithm SHA256).Hash.ToLower()
+    $headers = @{ 'x-apikey' = $env:VT_API_KEY }
+    $sizeLabel = if ($file.Length -ge 1MB) { "$sizeMB MB" } else { "$([math]::Round($file.Length / 1KB, 1)) KB" }
+    Write-Host "`nFile:       $($file.Name) ($sizeLabel)" -ForegroundColor Cyan
+    Write-Host "SHA256:     $sha" -ForegroundColor Cyan
+
+    # Lookup by hash first
+    $found = $false
+    try {
+        $report = Invoke-RestMethod -Uri "https://www.virustotal.com/api/v3/files/$sha" -Headers $headers -ErrorAction Stop
+        $found = $true
+    } catch {
+        $status = $null
+        if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+        if ($status -ne 404) {
+            Write-Error "VT API error: $_"
+            return
+        }
+    }
+
+    if ($found) {
+        $stats = $report.data.attributes.last_analysis_stats
+        $mal = $stats.malicious; $total = $mal + $stats.undetected + $stats.harmless + $stats.suspicious + $stats.timeout
+        $color = if ($mal -eq 0) { 'Green' } elseif ($mal -le 5) { 'Yellow' } else { 'Red' }
+        Write-Host "Detections: $mal/$total" -ForegroundColor $color
+        $vtLink = "https://www.virustotal.com/gui/file/$sha/detection"
+        Write-Host "Link:       $vtLink" -ForegroundColor Cyan
+        Start-Process $vtLink
+        $results = $report.data.attributes.last_analysis_results
+        $detections = if ($results) {
+            $results.PSObject.Properties |
+                Where-Object { $_.Value.category -eq 'malicious' } |
+                Sort-Object { $_.Value.engine_name }
+        }
+        if ($detections) {
+            Write-Host ''
+            foreach ($d in $detections) {
+                $engine = $d.Value.engine_name.PadRight(20)
+                Write-Host "  $engine $($d.Value.result)" -ForegroundColor Red
+            }
+        }
+        return
+    }
+
+    # File not known - upload
+    Write-Host 'Hash not found, uploading...' -ForegroundColor Yellow
+    $boundary = [guid]::NewGuid().ToString('N')
+    $fileBytes = [System.IO.File]::ReadAllBytes($resolved.Path)
+    $enc = [System.Text.Encoding]::GetEncoding('iso-8859-1')
+    $header = "--$boundary`r`nContent-Disposition: form-data; name=`"file`"; filename=`"$($file.Name)`"`r`nContent-Type: application/octet-stream`r`n`r`n"
+    $footer = "`r`n--$boundary--`r`n"
+    $bodyBytes = $enc.GetBytes($header) + $fileBytes + $enc.GetBytes($footer)
+    try {
+        $resp = Invoke-WebRequest -Uri 'https://www.virustotal.com/api/v3/files' `
+            -Method Post -Headers $headers `
+            -ContentType "multipart/form-data; boundary=$boundary" `
+            -Body $bodyBytes -UseBasicParsing -ErrorAction Stop
+        $link = ($resp.Content | ConvertFrom-Json).data.links.self
+        Write-Host "Uploaded. Analysis: $link" -ForegroundColor Green
+        $vtLink = "https://www.virustotal.com/gui/file/$sha/detection"
+        Write-Host "Link:       $vtLink" -ForegroundColor Cyan
+        Start-Process $vtLink
+    } catch {
+        Write-Error "Upload failed: $_"
+    }
+}
+
 # Docker Shortcuts (conditional)
 if (Get-Command docker -ErrorAction SilentlyContinue) {
     function dps { docker ps @args }
@@ -1495,12 +1576,13 @@ function http {
                 $_.ErrorDetails.Message
             }
             elseif ($_.Exception.Response | Get-Member -Name GetResponseStream -ErrorAction SilentlyContinue) {
+                $reader = $null
                 try {
                     $reader = [System.IO.StreamReader]::new($_.Exception.Response.GetResponseStream())
                     $reader.ReadToEnd()
-                    $reader.Dispose()
                 }
                 catch { Write-Error "HTTP error (could not read response body)" }
+                finally { if ($reader) { $reader.Dispose() } }
             }
         }
         else { Write-Error $_ }
@@ -1626,13 +1708,28 @@ if ($isInteractive -and (Get-Module PSReadLine)) {
     Set-PSReadLineKeyHandler -Chord 'Alt+v' -BriefDescription SmartPaste -Description 'Paste clipboard as one block into prompt' -ScriptBlock $smartPasteHandler
 
     # fzf integration via PSFzf (fuzzy history search on Ctrl+R, file finder on Ctrl+T)
+    # Lazy-loaded: PSFzf is imported on first Ctrl+R/Ctrl+T press, not at profile load,
+    # to prevent fzf from launching during terminal startup (VS Code shell integration, etc.)
     if (Get-Command fzf -ErrorAction SilentlyContinue) {
-        try {
-            Import-Module PSFzf -ErrorAction Stop
-            Set-PsFzfOption -PSReadlineChordProvider 'Ctrl+t' -PSReadlineChordReverseHistory 'Ctrl+r'
+        if (-not $env:FZF_DEFAULT_COMMAND -and (Get-Command rg -ErrorAction SilentlyContinue)) {
+            $env:FZF_DEFAULT_COMMAND = 'rg --files --hidden --glob "!.git"'
         }
-        catch {
-            Write-Verbose "PSFzf module not available: $_"
+        if (-not $env:FZF_DEFAULT_OPTS) {
+            $env:FZF_DEFAULT_OPTS = '--height=40% --layout=reverse'
+        }
+        Set-PSReadLineKeyHandler -Chord 'Ctrl+r' -BriefDescription FzfHistory -Description 'Fuzzy history search (fzf)' -ScriptBlock {
+            if (-not (Get-Module PSFzf)) {
+                try { Import-Module PSFzf -ErrorAction Stop }
+                catch { [Microsoft.PowerShell.PSConsoleReadLine]::Ding(); return }
+            }
+            Invoke-FzfPsReadlineHandlerHistory
+        }
+        Set-PSReadLineKeyHandler -Chord 'Ctrl+t' -BriefDescription FzfFileFind -Description 'Fuzzy file finder (fzf)' -ScriptBlock {
+            if (-not (Get-Module PSFzf)) {
+                try { Import-Module PSFzf -ErrorAction Stop }
+                catch { [Microsoft.PowerShell.PSConsoleReadLine]::Ding(); return }
+            }
+            Invoke-FzfPsReadlineHandlerProvider
         }
     }
 
@@ -1713,7 +1810,7 @@ if ($isInteractive) {
             }
             if (-not (Test-Path $localThemePath) -and $themeUrl) {
                 try {
-                    Invoke-RestMethod -Uri $themeUrl -OutFile $localThemePath -TimeoutSec 10
+                    Invoke-RestMethod -Uri $themeUrl -OutFile $localThemePath -TimeoutSec 10 -ErrorAction Stop
                     $themeSize = (Get-Item $localThemePath).Length
                     if ($themeSize -eq 0) { throw "Downloaded theme file is empty" }
                     $null = Get-Content $localThemePath -Raw | ConvertFrom-Json
@@ -1899,6 +1996,7 @@ ${g}hash${r} <file> [algo] - File hash (default SHA256).
 ${g}checksum${r} <file> <expected> - Verify file hash.
 ${g}genpass${r} [length] - Random password (default 20), copies to clipboard.
 ${g}b64${r} / ${g}b64d${r} <text> - Base64 encode / decode.
+${g}vt${r} <file> - VirusTotal scan (hash lookup, upload if unknown). Needs ${g}`$env:VT_API_KEY${r}.
 
 ${c}Developer${r}
 ${g}killport${r} <port> - Kill process on a TCP port.

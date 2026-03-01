@@ -319,7 +319,7 @@ function Install-OhMyPoshTheme {
     )
     $themeFilePath = Join-Path $configCachePath "$ThemeName.omp.json"
     try {
-        Invoke-RestMethod -Uri $ThemeUrl -OutFile $themeFilePath -TimeoutSec 10
+        Invoke-RestMethod -Uri $ThemeUrl -OutFile $themeFilePath -TimeoutSec 10 -ErrorAction Stop
         $themeSize = (Get-Item $themeFilePath).Length
         if ($themeSize -eq 0) { throw "Downloaded theme file is empty" }
         $null = Get-Content $themeFilePath -Raw | ConvertFrom-Json
