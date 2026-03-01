@@ -1266,6 +1266,16 @@ function vtscan {
 
     # File not known - upload
     Write-Host 'Hash not found, uploading...' -ForegroundColor Yellow
+    $uploadUrl = 'https://www.virustotal.com/api/v3/files'
+    if ($file.Length -gt 10MB) {
+        try {
+            $uploadUrl = (Invoke-RestMethod -Uri 'https://www.virustotal.com/api/v3/files/upload_url' -Headers $headers -ErrorAction Stop).data
+            Write-Host 'Using large-file upload endpoint.' -ForegroundColor DarkGray
+        } catch {
+            Write-Error "Failed to get upload URL: $_"
+            return
+        }
+    }
     $boundary = [guid]::NewGuid().ToString('N')
     $fileBytes = [System.IO.File]::ReadAllBytes($resolved.Path)
     $enc = [System.Text.Encoding]::GetEncoding('iso-8859-1')
@@ -1273,7 +1283,7 @@ function vtscan {
     $footer = "`r`n--$boundary--`r`n"
     $bodyBytes = $enc.GetBytes($header) + $fileBytes + $enc.GetBytes($footer)
     try {
-        $resp = Invoke-WebRequest -Uri 'https://www.virustotal.com/api/v3/files' `
+        $resp = Invoke-WebRequest -Uri $uploadUrl `
             -Method Post -Headers $headers `
             -ContentType "multipart/form-data; boundary=$boundary" `
             -Body $bodyBytes -UseBasicParsing -ErrorAction Stop
