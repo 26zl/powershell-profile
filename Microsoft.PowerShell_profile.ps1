@@ -41,6 +41,39 @@ $script:ProfileTools = @(
     @{ Name = "ripgrep"; Id = "BurntSushi.ripgrep.MSVC"; Cmd = "rg"; Cache = $null; VerCmd = "--version" }
 )
 
+# Download helper with retry, size validation, and corrupt-file cleanup
+function Invoke-DownloadWithRetry {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri,
+        [Parameter(Mandatory)]
+        [string]$OutFile,
+        [int]$TimeoutSec = 10,
+        [int]$MaxAttempts = 2,
+        [int]$BackoffSec = 2
+    )
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
+            Invoke-RestMethod -Uri $Uri -OutFile $OutFile -TimeoutSec $TimeoutSec -ErrorAction Stop
+            if (-not (Test-Path $OutFile) -or (Get-Item $OutFile).Length -eq 0) {
+                Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
+                throw 'Downloaded file is missing or empty'
+            }
+            return
+        }
+        catch {
+            if ($attempt -lt $MaxAttempts) {
+                Write-Warning "Download failed (attempt $attempt/$MaxAttempts): $_  Retrying in ${BackoffSec}s..."
+                Start-Sleep -Seconds $BackoffSec
+            }
+            else {
+                throw $_
+            }
+        }
+    }
+}
+
 # Check for Profile Updates (manual only)
 function Update-Profile {
     [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
@@ -55,29 +88,32 @@ function Update-Profile {
     $tempConfig = Join-Path $env:TEMP "theme.json"
     $tempTerminalConfig = Join-Path $env:TEMP "terminal-config.json"
 
+    $phaseErrors = @()
     try {
         # Phase 1: Download profile and config
         $profileUrl = "$repo_root/$repo_name/main/Microsoft.PowerShell_profile.ps1"
-        Invoke-RestMethod $profileUrl -OutFile $tempProfile -TimeoutSec 10 -ErrorAction Stop
+        Invoke-DownloadWithRetry -Uri $profileUrl -OutFile $tempProfile
 
         $configUrl = "$repo_root/$repo_name/main/theme.json"
         $configDownloaded = $false
         try {
-            Invoke-RestMethod $configUrl -OutFile $tempConfig -TimeoutSec 10 -ErrorAction Stop
+            Invoke-DownloadWithRetry -Uri $configUrl -OutFile $tempConfig
             $configDownloaded = $true
         }
         catch {
             Write-Warning "Could not download theme.json (non-fatal): $_"
+            $phaseErrors += "theme.json download: $_"
         }
 
         $terminalConfigUrl = "$repo_root/$repo_name/main/terminal-config.json"
         $terminalConfigDownloaded = $false
         try {
-            Invoke-RestMethod $terminalConfigUrl -OutFile $tempTerminalConfig -TimeoutSec 10 -ErrorAction Stop
+            Invoke-DownloadWithRetry -Uri $terminalConfigUrl -OutFile $tempTerminalConfig
             $terminalConfigDownloaded = $true
         }
         catch {
             Write-Warning "Could not download terminal-config.json (non-fatal): $_"
+            $phaseErrors += "terminal-config.json download: $_"
         }
 
         # Phase 2: Hash verification (profile .ps1 only)
@@ -115,9 +151,12 @@ function Update-Profile {
             $terminalLabel = if ($terminalConfigDownloaded) { $newTerminalConfigHash } else { "NONE" }
             $combinedInput = "profile:${profileLabel}:theme:${configLabel}:terminal:${terminalLabel}"
             $sha = [System.Security.Cryptography.SHA256]::Create()
-            $combinedHash = [BitConverter]::ToString(
-                $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($combinedInput))
-            ).Replace('-', '')
+            try {
+                $combinedHash = [BitConverter]::ToString(
+                    $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($combinedInput))
+                ).Replace('-', '')
+            }
+            finally { $sha.Dispose() }
 
             if (-not $ExpectedSha256) {
                 Write-Host "Downloaded file hashes:" -ForegroundColor Yellow
@@ -287,15 +326,13 @@ function Update-Profile {
             if ($shouldDownloadTheme -and $themeUrl) {
                 if ($PSCmdlet.ShouldProcess($localThemePath, "Download OMP theme '$themeName'")) {
                     try {
-                        Invoke-RestMethod -Uri $themeUrl -OutFile $localThemePath -TimeoutSec 10 -ErrorAction Stop
-                        # Validate: non-empty and parseable JSON
-                        $themeSize = (Get-Item $localThemePath).Length
-                        if ($themeSize -eq 0) { throw "Downloaded theme file is empty" }
+                        Invoke-DownloadWithRetry -Uri $themeUrl -OutFile $localThemePath
                         $null = Get-Content $localThemePath -Raw | ConvertFrom-Json
                         Write-Host "OMP theme '$themeName' updated." -ForegroundColor Green
                     }
                     catch {
                         Write-Warning "Failed to download/validate OMP theme: $_"
+                        $phaseErrors += "OMP theme download: $_"
                         Remove-Item $localThemePath -Force -ErrorAction SilentlyContinue
                     }
                 }
@@ -339,9 +376,34 @@ function Update-Profile {
                         Copy-Item $wtSettingsPath $backupPath -Force
                         Write-Host "WT backup: $backupPath" -ForegroundColor DarkGray
 
-                        $wtRaw = (Get-Content $wtSettingsPath -Raw) -replace $jsoncCommentPattern, ''
-                        $wt = $wtRaw | ConvertFrom-Json
+                        # Cleanup old WT backups (keep last 5)
+                        $wtLocalState = Split-Path $wtSettingsPath
+                        $oldBackups = Get-ChildItem -Path $wtLocalState -Filter "settings.json.*.bak" -ErrorAction SilentlyContinue |
+                        Sort-Object LastWriteTime -Descending | Select-Object -Skip 5
+                        foreach ($old in $oldBackups) {
+                            Remove-Item $old.FullName -Force -ErrorAction SilentlyContinue
+                        }
 
+                        # Read WT settings with retry (race condition mitigation if WT is writing)
+                        $wt = $null
+                        for ($wtAttempt = 1; $wtAttempt -le 2; $wtAttempt++) {
+                            try {
+                                $wtRaw = (Get-Content $wtSettingsPath -Raw) -replace $jsoncCommentPattern, ''
+                                $wt = $wtRaw | ConvertFrom-Json
+                                break
+                            }
+                            catch {
+                                if ($wtAttempt -lt 2) {
+                                    Write-Warning "WT settings parse failed, retrying in 1s..."
+                                    Start-Sleep -Seconds 1
+                                }
+                                else { throw }
+                            }
+                        }
+
+                        if (-not $wt.profiles) {
+                            $wt | Add-Member -NotePropertyName "profiles" -NotePropertyValue ([PSCustomObject]@{}) -Force
+                        }
                         if (-not $wt.profiles.defaults) {
                             $wt.profiles | Add-Member -NotePropertyName "defaults" -NotePropertyValue ([PSCustomObject]@{}) -Force
                         }
@@ -401,6 +463,20 @@ function Update-Profile {
                             }
                         }
 
+                        # Ensure PowerShell profiles launch with -NoLogo
+                        if ($wt.profiles.list) {
+                            foreach ($prof in @($wt.profiles.list)) {
+                                $cmd = if ($prof.commandline) { $prof.commandline } else { '' }
+                                $src = if ($prof.source) { $prof.source } else { '' }
+                                $isPwsh = $cmd -match 'pwsh' -or $src -match 'Windows\.Terminal\.PowerShellCore'
+                                $isPS5 = $cmd -match 'powershell\.exe' -or $prof.name -match 'Windows PowerShell'
+                                if (($isPwsh -or $isPS5) -and $cmd -notmatch '-NoLogo' -and $cmd -notmatch '(?i)-(Command|File|EncodedCommand)') {
+                                    $newCmd = if ($cmd) { "$cmd -NoLogo" } elseif ($isPwsh) { "pwsh.exe -NoLogo" } else { "powershell.exe -NoLogo" }
+                                    $prof | Add-Member -NotePropertyName "commandline" -NotePropertyValue $newCmd -Force
+                                }
+                            }
+                        }
+
                         $wtJson = $wt | ConvertTo-Json -Depth 10
                         $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
                         [System.IO.File]::WriteAllText($wtSettingsPath, $wtJson, $utf8NoBom)
@@ -408,6 +484,7 @@ function Update-Profile {
                     }
                     catch {
                         Write-Warning "Failed to update Windows Terminal settings: $_"
+                        $phaseErrors += "Windows Terminal sync: $_"
                     }
                 }
             }
@@ -423,7 +500,7 @@ function Update-Profile {
                     if ($PSCmdlet.ShouldProcess($tool.Name, "Install via winget")) {
                         Write-Host "  Installing $($tool.Name)..." -ForegroundColor Yellow
                         winget install -e --id $tool.Id --accept-source-agreements --accept-package-agreements
-                        if ($LASTEXITCODE -eq 0) {
+                        if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq -1978335185 -or $LASTEXITCODE -eq -1978335189) {
                             Write-Host "  $($tool.Name) installed." -ForegroundColor Green
                             $installedTools += $tool
                         }
@@ -467,6 +544,15 @@ function Update-Profile {
             }
         }
 
+        # Error summary
+        if ($phaseErrors.Count -gt 0) {
+            Write-Host ""
+            Write-Host "Update completed with $($phaseErrors.Count) issue(s):" -ForegroundColor Yellow
+            foreach ($err in $phaseErrors) {
+                Write-Host "  - $err" -ForegroundColor Yellow
+            }
+        }
+
         if ($profileChanged) {
             Write-Host "Please restart your shell to reflect changes." -ForegroundColor Magenta
         }
@@ -492,7 +578,9 @@ function Update-PowerShell {
         Write-Host "Checking for PowerShell updates..." -ForegroundColor Cyan
         $currentVersion = $PSVersionTable.PSVersion
         $gitHubApiUrl = "https://api.github.com/repos/PowerShell/PowerShell/releases/latest"
-        $latestReleaseInfo = Invoke-RestMethod -Uri $gitHubApiUrl -TimeoutSec 10
+        $headers = @{}
+        if ($env:GITHUB_TOKEN) { $headers['Authorization'] = "Bearer $env:GITHUB_TOKEN" }
+        $latestReleaseInfo = Invoke-RestMethod -Uri $gitHubApiUrl -TimeoutSec 10 -Headers $headers
         $latestVersionStr = $latestReleaseInfo.tag_name.Trim('v') -replace '-.*$', ''
         $latestVersion = [version]$latestVersionStr
         if ($currentVersion -lt $latestVersion) {
@@ -505,7 +593,16 @@ function Update-PowerShell {
         }
     }
     catch {
-        Write-Error "Failed to update PowerShell. Error: $_"
+        $statusCode = $null
+        if ($_.Exception.Response) {
+            $statusCode = [int]$_.Exception.Response.StatusCode
+        }
+        if ($statusCode -eq 403 -or $statusCode -eq 429) {
+            Write-Warning 'GitHub API rate limit exceeded. Try again later or set $env:GITHUB_TOKEN to increase the limit.'
+        }
+        else {
+            Write-Error "Failed to update PowerShell. Error: $_"
+        }
     }
 }
 # Update installed profile tools via winget (skips tools not present on this machine)
@@ -523,6 +620,8 @@ function Update-Tools {
         Write-Host "Updating $($tool.Name)..." -ForegroundColor Cyan
         winget upgrade --id $tool.Id --accept-source-agreements --accept-package-agreements
         if ($LASTEXITCODE -eq 0) {
+            # Refresh PATH so the new binary is found for version check
+            $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('PATH', 'User')
             $newVer = try { (& $tool.Cmd $tool.VerCmd 2>$null | Where-Object { $_ -match '\d+\.\d+' } | Select-Object -First 1).Trim() } catch { $null }
             if ($newVer -and $oldVer -and $newVer -ne $oldVer) {
                 Write-Host "  $($tool.Name): $oldVer -> $newVer" -ForegroundColor Green
@@ -589,20 +688,41 @@ function prompt {
 }
 $Host.UI.RawUI.WindowTitle = "PowerShell {0}$adminSuffix" -f $PSVersionTable.PSVersion.ToString()
 
-# Editor Configuration (lazy - only resolves on first use)
-function vim {
-    if ($null -eq $script:EDITOR) {
-        foreach ($e in 'code', 'sublime_text', 'notepad', 'nvim', 'vi') {
-            if (Get-Command $e -CommandType Application -ErrorAction SilentlyContinue) { $script:EDITOR = $e; break }
-        }
-        if ($null -eq $script:EDITOR) { $script:EDITOR = 'notepad' }
+# Editor Configuration (lazy - resolves on first use)
+# Override in profile_user.ps1, e.g.: $script:EditorPriority = @('nvim', 'code', 'notepad')
+if ($null -eq $script:EditorPriority) {
+    $script:EditorPriority = @('code', 'notepad')
+}
+$script:ResolvedEditor = $null
+
+function Resolve-PreferredEditor {
+    if ($script:ResolvedEditor -and (Get-Command $script:ResolvedEditor -CommandType Application -ErrorAction SilentlyContinue)) {
+        return $script:ResolvedEditor
     }
-    & $script:EDITOR @args
+
+    $candidates = @()
+    if ($env:EDITOR) { $candidates += $env:EDITOR }
+    $candidates += @($script:EditorPriority)
+
+    foreach ($candidate in ($candidates | Where-Object { $_ })) {
+        if (Get-Command $candidate -CommandType Application -ErrorAction SilentlyContinue) {
+            $script:ResolvedEditor = $candidate
+            return $script:ResolvedEditor
+        }
+    }
+
+    $script:ResolvedEditor = 'notepad'
+    return $script:ResolvedEditor
+}
+
+function edit {
+    $editor = Resolve-PreferredEditor
+    & $editor @args
 }
 
 # Quick Access to Editing the Profile
 function Edit-Profile {
-    vim $PROFILE
+    edit $PROFILE
 }
 Set-Alias -Name ep -Value Edit-Profile
 
@@ -673,16 +793,20 @@ function admin {
 
 Set-Alias -Name su -Value admin
 # System Uptime (PS5-compatible)
+# Shared boot-time helper (PS5: WMI, PS7: Get-Uptime)
+function Get-SystemBootTime {
+    if ($PSVersionTable.PSVersion.Major -eq 5) {
+        $lastBoot = (Get-WmiObject win32_operatingsystem).LastBootUpTime
+        [System.Management.ManagementDateTimeConverter]::ToDateTime($lastBoot)
+    }
+    else {
+        (Get-Uptime -Since)
+    }
+}
+
 function uptime {
     try {
-        if ($PSVersionTable.PSVersion.Major -eq 5) {
-            $lastBoot = (Get-WmiObject win32_operatingsystem).LastBootUpTime
-            $bootTime = [System.Management.ManagementDateTimeConverter]::ToDateTime($lastBoot)
-        }
-        else {
-            $bootTime = (Get-Uptime -Since)
-        }
-
+        $bootTime = Get-SystemBootTime
         $formattedBootTime = $bootTime.ToString("dddd, MMMM dd, yyyy HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture)
         Write-Host "System started on: $formattedBootTime" -ForegroundColor DarkGray
 
@@ -693,24 +817,15 @@ function uptime {
         Write-Error "An error occurred while retrieving system uptime."
     }
 }
-# Unzip Utility (PS5-compatible)
-function unzip {
-    param([Parameter(Mandatory)][string]$File)
-    $resolved = Resolve-Path -LiteralPath $File -ErrorAction SilentlyContinue
-    if (-not $resolved) { Write-Error "File not found: $File"; return }
-    if ($resolved.Path -notmatch '\.zip$') { Write-Error "Not a zip file: $File"; return }
-    Write-Host "Extracting $($resolved.Path) to $pwd" -ForegroundColor Cyan
-    Expand-Archive -Path $resolved.Path -DestinationPath $pwd -Force
-}
-
+# Universal archive extractor (.zip, .tar, .gz, .7z, .rar)
 function extract {
     param([Parameter(Mandatory)][string]$File)
     $resolved = Resolve-Path -LiteralPath $File -ErrorAction SilentlyContinue
     if (-not $resolved) { Write-Error "File not found: $File"; return }
     $path = $resolved.Path
     $ext = [System.IO.Path]::GetExtension($path).ToLower()
-    $name = [System.IO.Path]::GetFileNameWithoutExtension($path)
-    if ($name.EndsWith('.tar')) { $ext = '.tar' + $ext; $name = [System.IO.Path]::GetFileNameWithoutExtension($name) }
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($path)
+    if ($baseName.EndsWith('.tar')) { $ext = '.tar' + $ext }
     Write-Host "Extracting $path ..." -ForegroundColor Cyan
     switch ($ext) {
         '.zip' { Expand-Archive -Path $path -DestinationPath $pwd -Force }
@@ -718,7 +833,21 @@ function extract {
         '.tar.gz' { tar -xzf "$path" -C "$pwd"; if ($LASTEXITCODE -ne 0) { Write-Error "tar extraction failed (exit $LASTEXITCODE)" } }
         '.tgz' { tar -xzf "$path" -C "$pwd"; if ($LASTEXITCODE -ne 0) { Write-Error "tar extraction failed (exit $LASTEXITCODE)" } }
         '.tar.bz2' { tar -xjf "$path" -C "$pwd"; if ($LASTEXITCODE -ne 0) { Write-Error "tar extraction failed (exit $LASTEXITCODE)" } }
-        '.gz' { tar -xzf "$path" -C "$pwd"; if ($LASTEXITCODE -ne 0) { Write-Error "tar extraction failed (exit $LASTEXITCODE)" } }
+        '.gz' {
+            $outFile = Join-Path $pwd $baseName
+            $in = [System.IO.File]::OpenRead($path)
+            try {
+                $gz = New-Object System.IO.Compression.GZipStream($in, [System.IO.Compression.CompressionMode]::Decompress)
+                try {
+                    $out = [System.IO.File]::Create($outFile)
+                    try { $gz.CopyTo($out) }
+                    finally { $out.Dispose() }
+                }
+                finally { $gz.Dispose() }
+            }
+            finally { $in.Dispose() }
+            Write-Host "Extracted to $outFile" -ForegroundColor Green
+        }
         '.7z' {
             if (-not (Get-Command 7z -ErrorAction SilentlyContinue)) { Write-Error "7z not found. Install with: winget install 7zip.7zip"; return }
             7z x "$path" -o"$pwd"
@@ -730,6 +859,7 @@ function extract {
         default { Write-Error "Unsupported format: $ext" }
     }
 }
+
 # Hastebin-like upload function (PS5-compatible, no dependencies)
 function hb {
     if ($args.Length -eq 0) {
@@ -788,6 +918,7 @@ function sed($file, $find, $replace) {
         return
     }
     if ($null -eq $find -or $find -eq '') { Write-Error "Usage: sed <file> <find> <replace>"; return }
+    if ($null -eq $replace) { $replace = '' }
     $content = Get-Content $file -Raw
     if (-not $content) { Write-Warning "File is empty: $file"; return }
     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
@@ -860,7 +991,7 @@ function file {
     elseif ($hex.StartsWith('FD377A58')) { $result = 'XZ compressed data' }
     elseif ($hex.StartsWith('377ABCAF')) { $result = '7-zip archive' }
     elseif ($hex.StartsWith('526172')) { $result = 'RAR archive' }
-    elseif ($hex.StartsWith('7573746172') -or ($readLen -ge 262 -and [System.Text.Encoding]::ASCII.GetString($bytes, 257, [Math]::Min(5, $readLen - 257)) -eq 'ustar')) { $result = 'POSIX tar archive' }
+    elseif ($readLen -ge 262 -and [System.Text.Encoding]::ASCII.GetString($bytes, 257, [Math]::Min(5, $readLen - 257)) -eq 'ustar') { $result = 'POSIX tar archive' }
     elseif ($hex.StartsWith('4F676753')) { $result = 'OGG audio' }
     elseif ($hex.StartsWith('664C6143')) { $result = 'FLAC audio' }
     elseif ($hex.StartsWith('494433') -or $hex.StartsWith('FFFB') -or $hex.StartsWith('FFF3') -or $hex.StartsWith('FFE3')) { $result = 'MP3 audio' }
@@ -907,6 +1038,7 @@ function file {
 
 # Set an environment variable in the current session
 function export($name, $value) {
+    if (-not $name) { Write-Error "Usage: export <name> <value>"; return }
     set-item -force -path "env:$name" -value $value;
 }
 
@@ -918,29 +1050,32 @@ function pkill($name) {
 
 # List processes by name
 function pgrep($name) {
+    if (-not $name) { Write-Error "Usage: pgrep <name>"; return }
     Get-Process $name -ErrorAction SilentlyContinue
 }
 
 # Display first n lines of a file (default 10)
 function head {
     param($Path, $n = 10)
+    if (-not $Path) { Write-Error "Usage: head <path> [n]"; return }
     Get-Content $Path -Head $n
 }
 
 # Display last n lines of a file (default 10, -f to follow)
 function tail {
     param($Path, $n = 10, [switch]$f = $false)
+    if (-not $Path) { Write-Error "Usage: tail <path> [n] [-f]"; return }
     Get-Content $Path -Tail $n -Wait:$f
 }
 
-# Quick File Creation
-function nf { param($name) New-Item -ItemType "file" -Path . -Name $name }
+Set-Alias -Name nf -Value touch
 
 # Directory Management
-function mkcd { param($dir) mkdir $dir -Force; Set-Location $dir }
+function mkcd { param($dir) if (-not $dir) { Write-Error "Usage: mkcd <dir>"; return }; mkdir $dir -Force -ErrorAction Stop | Out-Null; Set-Location $dir }
 
 # Move item to Recycle Bin via Shell.Application COM
 function trash($path) {
+    if (-not $path) { Write-Error "Usage: trash <path>"; return }
     if (-not (Test-Path -LiteralPath $path)) {
         Write-Host "Error: Item '$path' does not exist."
         return
@@ -956,18 +1091,23 @@ function trash($path) {
     }
 
     $shell = New-Object -ComObject 'Shell.Application'
-    $folder = $shell.NameSpace($parentPath)
-    if (-not $folder) {
-        Write-Host "Error: Cannot access parent folder '$parentPath'."
-        return
+    try {
+        $folder = $shell.NameSpace($parentPath)
+        if (-not $folder) {
+            Write-Host "Error: Cannot access parent folder '$parentPath'."
+            return
+        }
+        $shellItem = $folder.ParseName($item.Name)
+        if (-not $shellItem) {
+            Write-Host "Error: Cannot find '$($item.Name)' in '$parentPath'."
+            return
+        }
+        $shellItem.InvokeVerb('delete')
+        Write-Host "Item '$($item.FullName)' has been moved to the Recycle Bin."
     }
-    $shellItem = $folder.ParseName($item.Name)
-    if (-not $shellItem) {
-        Write-Host "Error: Cannot find '$($item.Name)' in '$parentPath'."
-        return
+    finally {
+        [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
     }
-    $shellItem.InvokeVerb('delete')
-    Write-Host "Item '$($item.FullName)' has been moved to the Recycle Bin."
 }
 
 ### Quality of Life Aliases
@@ -1000,7 +1140,7 @@ if (Get-Command eza -ErrorAction SilentlyContinue) {
 else {
     if ($isInteractive) { Write-Warning "eza not found. Install it with: winget install -e --id eza-community.eza" }
     function la { Get-ChildItem -Force | Format-Table -AutoSize }
-    function ll { Get-ChildItem -Force | Format-Table -AutoSize }
+    function ll { Get-ChildItem -Force | Format-Table Mode, LastWriteTime, Length, Name -AutoSize }
     function lt { Get-ChildItem -Recurse -Depth 2 | Format-Table -AutoSize }
 }
 
@@ -1059,15 +1199,9 @@ function gcom {
 # Add all + commit + push
 function lazyg {
     if (-not $args) { Write-Error "Usage: lazyg <message>"; return }
-    git add .
-    if ($LASTEXITCODE -ne 0) { Write-Warning "git add failed. Commit skipped."; return }
-    git commit -m "$args"
-    if ($LASTEXITCODE -eq 0) {
-        git push
-    }
-    else {
-        Write-Warning "Commit failed. Push skipped."
-    }
+    gcom @args
+    if ($LASTEXITCODE -eq 0) { git push }
+    else { Write-Warning "Commit failed. Push skipped." }
 }
 
 # Quick Access to System Information
@@ -1152,7 +1286,7 @@ function checksum {
         128 { 'SHA512' }
         default { 'SHA256' }
     }
-    $actual = (Get-FileHash -Path $File -Algorithm $algo).Hash
+    $actual = hash -File $File -Algorithm $algo
     if ($actual -eq $Expected.ToUpper()) {
         Write-Host "MATCH ($algo)" -ForegroundColor Green
     }
@@ -1231,7 +1365,8 @@ function vtscan {
     try {
         $report = Invoke-RestMethod -Uri "https://www.virustotal.com/api/v3/files/$sha" -Headers $headers -ErrorAction Stop
         $found = $true
-    } catch {
+    }
+    catch {
         $status = $null
         if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
         if ($status -ne 404) {
@@ -1251,8 +1386,8 @@ function vtscan {
         $results = $report.data.attributes.last_analysis_results
         $detections = if ($results) {
             $results.PSObject.Properties |
-                Where-Object { $_.Value.category -eq 'malicious' } |
-                Sort-Object { $_.Value.engine_name }
+            Where-Object { $_.Value.category -eq 'malicious' } |
+            Sort-Object { $_.Value.engine_name }
         }
         if ($detections) {
             Write-Host ''
@@ -1271,7 +1406,8 @@ function vtscan {
         try {
             $uploadUrl = (Invoke-RestMethod -Uri 'https://www.virustotal.com/api/v3/files/upload_url' -Headers $headers -ErrorAction Stop).data
             Write-Host 'Using large-file upload endpoint.' -ForegroundColor DarkGray
-        } catch {
+        }
+        catch {
             Write-Error "Failed to get upload URL: $_"
             return
         }
@@ -1279,7 +1415,8 @@ function vtscan {
     $boundary = [guid]::NewGuid().ToString('N')
     $fileBytes = [System.IO.File]::ReadAllBytes($resolved.Path)
     $enc = [System.Text.Encoding]::GetEncoding('iso-8859-1')
-    $header = "--$boundary`r`nContent-Disposition: form-data; name=`"file`"; filename=`"$($file.Name)`"`r`nContent-Type: application/octet-stream`r`n`r`n"
+    $safeName = $file.Name -replace '["\r\n]', '_'
+    $header = "--$boundary`r`nContent-Disposition: form-data; name=`"file`"; filename=`"$safeName`"`r`nContent-Type: application/octet-stream`r`n`r`n"
     $footer = "`r`n--$boundary--`r`n"
     $bodyBytes = $enc.GetBytes($header) + $fileBytes + $enc.GetBytes($footer)
     try {
@@ -1292,7 +1429,8 @@ function vtscan {
         $vtLink = "https://www.virustotal.com/gui/file/$sha/detection"
         Write-Host "Link:       $vtLink" -ForegroundColor Cyan
         Start-Process $vtLink
-    } catch {
+    }
+    catch {
         Write-Error "Upload failed: $_"
     }
 }
@@ -1344,13 +1482,7 @@ function svc {
         $memPct = [math]::Round($usedMem / $totalMem * 100)
         $cpuLoad = try { [math]::Round((Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average) } catch { 0 }
         $procCount = @(Get-Process).Count
-        if ($PSVersionTable.PSVersion.Major -ge 6) {
-            $up = (Get-Uptime)
-        }
-        else {
-            $boot = $os.LastBootUpTime
-            $up = (Get-Date) - $boot
-        }
+        $up = (Get-Date) - (Get-SystemBootTime)
         $upStr = '{0}d {1}h {2}m' -f $up.Days, $up.Hours, $up.Minutes
         Write-Host ''
         Write-Host ('  CPU: {0}%  |  Mem: {1}/{2} GB ({3}%)  |  Procs: {4}  |  Up: {5}' -f $cpuLoad, $usedMem, $totalMem, $memPct, $procCount, $upStr) -ForegroundColor Cyan
@@ -1458,8 +1590,14 @@ function wifipass {
 
 function hosts {
     $hostsPath = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
-    $editor = if ($env:EDITOR) { $env:EDITOR } elseif (Get-Command code -ErrorAction SilentlyContinue) { 'code' } else { 'notepad' }
-    Start-Process $editor $hostsPath -Verb RunAs
+    $editor = Resolve-PreferredEditor
+    $cmdInfo = Get-Command $editor -ErrorAction SilentlyContinue
+    if ($cmdInfo -and $cmdInfo.CommandType -eq 'Application' -and $cmdInfo.Source -match '\.(cmd|bat)$') {
+        Start-Process cmd -Verb RunAs -ArgumentList "/c `"$editor`" `"$hostsPath`""
+    }
+    else {
+        Start-Process $editor $hostsPath -Verb RunAs
+    }
 }
 
 function speedtest {
@@ -1628,6 +1766,221 @@ function prettyjson {
     catch { Write-Error "Invalid JSON: $_" }
 }
 
+# JWT decode (strips Bearer prefix, decodes header + payload without verification)
+function jwtd {
+    param([Parameter(Mandatory)][string]$Token)
+    $Token = $Token -replace '^Bearer\s+', ''
+    $parts = $Token -split '\.'
+    if ($parts.Count -lt 2) { Write-Error "Invalid JWT: expected at least 2 dot-separated parts"; return }
+    foreach ($i in 0, 1) {
+        $label = if ($i -eq 0) { 'Header' } else { 'Payload' }
+        $b64 = $parts[$i].Replace('-', '+').Replace('_', '/')
+        $mod = $b64.Length % 4
+        if ($mod -eq 2) { $b64 += '==' }
+        elseif ($mod -eq 3) { $b64 += '=' }
+        try {
+            $json = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
+            Write-Host "${label}:" -ForegroundColor Cyan
+            $json | ConvertFrom-Json | ConvertTo-Json -Depth 10
+        }
+        catch { Write-Error "Failed to decode ${label}: $_" }
+    }
+}
+
+# Unix timestamp converter (no args = now, number = epoch to date, date string = date to epoch)
+function epoch {
+    param([string]$Value)
+    $unixEpoch = [DateTime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
+    if (-not $Value) {
+        [int64]([DateTime]::UtcNow - $unixEpoch).TotalSeconds
+        return
+    }
+    $num = [int64]0
+    if ([int64]::TryParse($Value, [ref]$num)) {
+        $secs = if ($num -gt 1000000000000) { [int64]($num / 1000) } else { $num }
+        $unixEpoch.AddSeconds($secs).ToLocalTime()
+    }
+    else {
+        try {
+            $date = [DateTime]::Parse($Value)
+            [int64]($date.ToUniversalTime() - $unixEpoch).TotalSeconds
+        }
+        catch { Write-Error "Could not parse: $Value" }
+    }
+}
+
+# Generate UUID/GUID and copy to clipboard
+function uuid {
+    $id = [guid]::NewGuid().ToString()
+    Set-Clipboard $id
+    Write-Host "$id (copied)" -ForegroundColor Green
+}
+
+# URL encode / decode
+function urlencode {
+    param([Parameter(Mandatory)][string]$Text)
+    [System.Uri]::EscapeDataString($Text)
+}
+function urldecode {
+    param([Parameter(Mandatory)][string]$Text)
+    [System.Uri]::UnescapeDataString($Text)
+}
+
+# Measure execution time of a scriptblock
+function timer {
+    param([Parameter(Mandatory)][scriptblock]$Command)
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    & $Command
+    $sw.Stop()
+    Write-Host ('Elapsed: {0:N3}s' -f $sw.Elapsed.TotalSeconds) -ForegroundColor Cyan
+}
+
+# Search/list environment variables
+function env {
+    param([string]$Pattern)
+    $vars = Get-ChildItem env: | Sort-Object Name
+    if ($Pattern) { $vars = $vars | Where-Object { $_.Name -match $Pattern -or $_.Value -match $Pattern } }
+    $vars | Format-Table Name, Value -AutoSize -Wrap
+}
+
+# Check TLS certificate expiry and details for a domain
+function tlscert {
+    param(
+        [Parameter(Mandatory)][string]$Domain,
+        [int]$Port = 443
+    )
+    $tcp = $null; $ssl = $null; $cert = $null
+    try {
+        $tcp = New-Object System.Net.Sockets.TcpClient($Domain, $Port)
+        $ssl = New-Object System.Net.Security.SslStream($tcp.GetStream(), $false, {$true})
+        $ssl.AuthenticateAsClient($Domain)
+        $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($ssl.RemoteCertificate)
+        $daysLeft = [math]::Floor(($cert.NotAfter - (Get-Date)).TotalDays)
+        $color = if ($daysLeft -lt 30) { 'Red' } elseif ($daysLeft -lt 90) { 'Yellow' } else { 'Green' }
+        Write-Host "  Subject:     $($cert.Subject)" -ForegroundColor White
+        Write-Host "  Issuer:      $($cert.Issuer)" -ForegroundColor White
+        Write-Host "  Valid from:  $($cert.NotBefore)" -ForegroundColor White
+        Write-Host "  Expires:     $($cert.NotAfter)" -ForegroundColor White
+        Write-Host "  Days left:   $daysLeft" -ForegroundColor $color
+        Write-Host "  Thumbprint:  $($cert.Thumbprint)" -ForegroundColor DarkGray
+    }
+    catch { Write-Error "Failed to check certificate for ${Domain}:${Port} - $_" }
+    finally {
+        if ($cert) { $cert.Dispose() }
+        if ($ssl) { $ssl.Dispose() }
+        if ($tcp) { $tcp.Dispose() }
+    }
+}
+
+# Quick TCP port scan
+function portscan {
+    param(
+        [Parameter(Mandatory)][string]$Hostname,
+        [int[]]$Ports = @(21, 22, 25, 53, 80, 443, 445, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 27017)
+    )
+    Write-Host "Scanning $Hostname..." -ForegroundColor Cyan
+    $open = 0
+    foreach ($port in $Ports) {
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        try {
+            $async = $tcp.BeginConnect($Hostname, $port, $null, $null)
+            $connected = $async.AsyncWaitHandle.WaitOne(500) -and $tcp.Connected
+            try { $tcp.EndConnect($async) } catch { $null = $_ }
+            if ($connected) {
+                Write-Host ("  {0,-6} open" -f $port) -ForegroundColor Green
+                $open++
+            }
+        }
+        catch { Write-Verbose "Port $port closed or filtered" }
+        finally { $tcp.Dispose() }
+    }
+    if ($open -eq 0) { Write-Host "  No open ports found." -ForegroundColor Yellow }
+    Write-Host ("Scan complete ({0}/{1} open)." -f $open, $Ports.Count) -ForegroundColor Cyan
+}
+
+# IP geolocation lookup (no args = your public IP)
+function ipinfo {
+    param([string]$IpAddress)
+    $url = if ($IpAddress) { "http://ip-api.com/json/$IpAddress" } else { "http://ip-api.com/json/" }
+    try {
+        $info = Invoke-RestMethod -Uri $url -TimeoutSec 10
+        if ($info.status -eq 'fail') { Write-Error "Lookup failed: $($info.message)"; return }
+        Write-Host "  IP:       $($info.query)" -ForegroundColor White
+        Write-Host "  Location: $($info.city), $($info.regionName), $($info.country)" -ForegroundColor White
+        Write-Host "  ISP:      $($info.isp)" -ForegroundColor White
+        Write-Host "  Org:      $($info.org)" -ForegroundColor DarkGray
+        Write-Host "  AS:       $($info.as)" -ForegroundColor DarkGray
+    }
+    catch { Write-Error "Failed to lookup IP info: $_" }
+}
+
+# Quick timestamped backup of a file
+function bak {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path $Path)) { Write-Error "File not found: $Path"; return }
+    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $dest = "$Path.$timestamp.bak"
+    Copy-Item -Path $Path -Destination $dest -Force
+    Write-Host "Backup: $dest" -ForegroundColor Green
+}
+
+# Repeat a command at intervals (like Linux watch)
+function watch {
+    param(
+        [Parameter(Mandatory)][scriptblock]$Command,
+        [int]$Interval = 2
+    )
+    Write-Host "Every ${Interval}s. Ctrl+C to stop." -ForegroundColor DarkGray
+    while ($true) {
+        Clear-Host
+        Write-Host ("watch: every {0}s | {1}" -f $Interval, (Get-Date -Format "HH:mm:ss")) -ForegroundColor DarkGray
+        Write-Host ""
+        try { & $Command }
+        catch { Write-Host $_.Exception.Message -ForegroundColor Red }
+        Start-Sleep -Seconds $Interval
+    }
+}
+
+# WHOIS domain lookup via RDAP (IANA standard, no external tools needed)
+function whois {
+    param([Parameter(Mandatory)][string]$Domain)
+    $Domain = $Domain -replace '^https?://', '' -replace '/.*$', ''
+    try {
+        $rdap = Invoke-RestMethod -Uri "https://rdap.org/domain/$Domain" -TimeoutSec 10
+        Write-Host "  Domain:     $($rdap.ldhName)" -ForegroundColor White
+        Write-Host "  Status:     $($rdap.status -join ', ')" -ForegroundColor White
+        if ($rdap.entities) {
+            $registrar = $rdap.entities | Where-Object { $_.roles -contains 'registrar' } | Select-Object -First 1
+            if ($registrar -and $registrar.vcardArray) {
+                $fn = $registrar.vcardArray[1] | Where-Object { $_[0] -eq 'fn' } | ForEach-Object { $_[3] }
+                if ($fn) { Write-Host "  Registrar:  $fn" -ForegroundColor White }
+            }
+        }
+        foreach ($ev in $rdap.events) {
+            $label = switch ($ev.eventAction) {
+                'registration'    { 'Registered' }
+                'expiration'      { 'Expires' }
+                'last changed'    { 'Updated' }
+                default           { $ev.eventAction }
+            }
+            if ($label) {
+                $date = ([DateTime]$ev.eventDate).ToString('yyyy-MM-dd')
+                Write-Host "  ${label}:$((' ' * [math]::Max(1, 12 - $label.Length)))$date" -ForegroundColor White
+            }
+        }
+        if ($rdap.nameservers) {
+            $ns = ($rdap.nameservers | ForEach-Object { $_.ldhName }) -join ', '
+            Write-Host "  Nameservers: $ns" -ForegroundColor DarkGray
+        }
+    }
+    catch {
+        if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 404) {
+            Write-Error "Domain not found: $Domain"
+        }
+        else { Write-Error "WHOIS lookup failed: $_" }
+    }
+}
+
 # Clipboard Utilities
 function cpy { if (-not $args) { Write-Error "Usage: cpy <text>"; return }; Set-Clipboard ($args -join ' ') }
 function pst { Get-Clipboard }
@@ -1713,17 +2066,8 @@ if ($isInteractive -and (Get-Module PSReadLine)) {
     Set-PSReadLineKeyHandler -Chord 'Ctrl+z' -Function Undo
     Set-PSReadLineKeyHandler -Chord 'Ctrl+y' -Function Redo
     $smartPasteHandler = {
-        try {
-            $clipboardText = Get-Clipboard -Raw
-            if ([string]::IsNullOrWhiteSpace($clipboardText)) {
-                [Microsoft.PowerShell.PSConsoleReadLine]::Ding()
-                return
-            }
-            [Microsoft.PowerShell.PSConsoleReadLine]::Insert($clipboardText)
-        }
-        catch {
-            [Microsoft.PowerShell.PSConsoleReadLine]::Ding()
-        }
+        try { Invoke-Clipboard }
+        catch { [Microsoft.PowerShell.PSConsoleReadLine]::Ding() }
     }
     Set-PSReadLineKeyHandler -Chord 'Alt+v' -BriefDescription SmartPaste -Description 'Paste clipboard as one block into prompt' -ScriptBlock $smartPasteHandler
 
@@ -1960,7 +2304,8 @@ ${c}PowerShell Profile Help${r}
 ${y}=======================${r}
 
 ${c}Profile & Updates${r}
-${g}Edit-Profile${r} / ${g}ep${r} - Open profile in editor.
+${g}Edit-Profile${r} / ${g}ep${r} - Open profile in preferred editor.
+${g}edit${r} <file> - Open file in preferred editor.
 ${g}Update-Profile${r} - Sync profile, theme, caches, and WT settings. Use -Force to re-apply.
 ${g}Update-PowerShell${r} - Check for new PowerShell releases.
 ${g}Update-Tools${r} - Update Oh My Posh, eza, zoxide, fzf, bat, and ripgrep.
@@ -1979,8 +2324,9 @@ ${g}cat${r} <file> - Syntax-highlighted viewer (bat).
 ${g}ff${r} <name> - Find files recursively.  ${g}nf${r} <name> - Create new file.
 ${g}mkcd${r} <dir> - Create dir and cd into it.
 ${g}touch${r} <file> - Create file or update timestamp.
-${g}trash${r} <path> - Move to Recycle Bin.  ${g}unzip${r} <file> - Extract zip.
+${g}trash${r} <path> - Move to Recycle Bin.
 ${g}extract${r} <file> - Universal extractor (.zip, .tar, .gz, .7z, .rar).
+${g}file${r} <path> - Identify file type via magic bytes (like Linux file command).
 ${g}sizeof${r} <path> - Human-readable file/directory size.
 ${g}docs${r} / ${g}dtop${r} - Jump to Documents / Desktop.
 
@@ -1998,7 +2344,12 @@ ${g}pubip${r} - Public IP.  ${g}localip${r} - Local IPv4 addresses.
 ${g}uptime${r} - System uptime.  ${g}sysinfo${r} - Detailed system info.
 ${g}df${r} - Disk volumes.  ${g}flushdns${r} - Clear DNS cache.
 ${g}ports${r} - Listening TCP ports.  ${g}checkport${r} <host> <port> - Test TCP connectivity.
+${g}portscan${r} <host> [-Ports n,n,...] - Quick TCP port scan.
+${g}tlscert${r} <domain> [port] - Check TLS certificate expiry and details.
+${g}ipinfo${r} [ip] - IP geolocation lookup (no args = your IP).
+${g}whois${r} <domain> - WHOIS domain lookup (registrar, dates, nameservers).
 ${g}nslook${r} <domain> [type] - DNS lookup (A, MX, TXT, etc.).
+${g}env${r} [pattern] - Search/list environment variables.
 ${g}svc${r} [name] [-Count n] [-Live] - htop-like process viewer.
 ${g}eventlog${r} [n] - Last n event log entries (default 20).
 ${g}path${r} - Display PATH entries one per line.
@@ -2009,13 +2360,17 @@ ${g}hosts${r} - Open hosts file in elevated editor.
 ${g}Clear-Cache${r} [-IncludeSystemCaches] - Clear user/system caches.
 ${g}Clear-ProfileCache${r} - Reset all profile caches (OMP, zoxide, configs).
 ${g}winutil${r} - Launch Chris Titus WinUtil.
-${g}harden${r} - Open Harden System Security (MS Store).
+${g}harden${r} - Open Harden Windows Security.
 
 ${c}Security & Crypto${r}
 ${g}hash${r} <file> [algo] - File hash (default SHA256).
 ${g}checksum${r} <file> <expected> - Verify file hash.
 ${g}genpass${r} [length] - Random password (default 20), copies to clipboard.
 ${g}b64${r} / ${g}b64d${r} <text> - Base64 encode / decode.
+${g}jwtd${r} <token> - Decode JWT header and payload.
+${g}uuid${r} - Generate random UUID (copies to clipboard).
+${g}epoch${r} [value] - Unix timestamp converter (no args = now).
+${g}urlencode${r} / ${g}urldecode${r} <text> - URL encode / decode.
 ${g}vtscan${r} <file> - Quick VirusTotal scan + open in browser. Uses ${g}`$env:VTCLI_APIKEY${r} or ${g}vt init${r}.
 ${g}vt${r} <subcommand> - Full VirusTotal CLI (vt-cli). Run ${g}vt --help${r} for details.
 
@@ -2024,6 +2379,9 @@ ${g}killport${r} <port> - Kill process on a TCP port.
 ${g}http${r} <url> [-Method POST] [-Body '...'] - HTTP requests, auto-formats JSON.
 ${g}prettyjson${r} <file> - Pretty-print JSON (or pipe: ${g}cat data.json | prettyjson${r}).
 ${g}hb${r} <file> - Upload to hastebin, copy URL.
+${g}timer${r} { command } - Measure execution time.
+${g}watch${r} { command } [-Interval n] - Repeat command every n seconds (default 2).
+${g}bak${r} <file> - Quick timestamped backup.
 
 ${c}Docker${r} (when installed)
 ${g}dps${r} / ${g}dpa${r} - Running / all containers.  ${g}dimg${r} - Images.

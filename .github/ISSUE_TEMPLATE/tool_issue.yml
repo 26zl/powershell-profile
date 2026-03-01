@@ -1,0 +1,53 @@
+name: Tool Issue
+description: Report an issue with a managed tool (eza, zoxide, fzf, bat, ripgrep, Oh My Posh)
+title: "[Tool] "
+labels: ["tool-issue"]
+body:
+  - type: dropdown
+    id: tool
+    attributes:
+      label: Which tool?
+      options:
+        - Oh My Posh
+        - eza
+        - zoxide
+        - fzf
+        - bat
+        - ripgrep
+    validations:
+      required: true
+
+  - type: input
+    id: tool-version
+    attributes:
+      label: Tool version
+      description: "Run `Update-Tools` or check the tool's `--version` output"
+      placeholder: "e.g. eza 0.20.14"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: ps-version
+    attributes:
+      label: PowerShell version
+      options:
+        - PowerShell 5.1
+        - PowerShell 7+
+        - Both
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Describe the issue with the tool
+    validations:
+      required: true
+
+  - type: textarea
+    id: error-output
+    attributes:
+      label: Error output
+      description: Paste any error messages or relevant terminal output
+      render: powershell

@@ -68,7 +68,9 @@ function Install-NerdFonts {
 
     try {
         [void] [System.Reflection.Assembly]::LoadWithPartialName("System.Drawing")
-        $fontFamilies = (New-Object System.Drawing.Text.InstalledFontCollection).Families.Name
+        $fontCollection = New-Object System.Drawing.Text.InstalledFontCollection
+        $fontFamilies = $fontCollection.Families.Name
+        $fontCollection.Dispose()
         if ($fontFamilies -notcontains "${FontDisplayName}") {
             Write-Host "  Installing ${FontDisplayName}..." -ForegroundColor Yellow
             $fontZipUrl = "https://github.com/ryanoasis/nerd-fonts/releases/download/v${Version}/${FontName}.zip"
@@ -81,6 +83,9 @@ function Install-NerdFonts {
             }
             finally {
                 $webClient.Dispose()
+            }
+            if (-not (Test-Path $zipFilePath) -or (Get-Item $zipFilePath).Length -eq 0) {
+                throw "Font download is missing or empty"
             }
 
             Expand-Archive -Path $zipFilePath -DestinationPath $extractPath -Force
@@ -106,6 +111,9 @@ function Install-NerdFonts {
                 }
             }
 
+            if ($copied -gt 0 -and $pending) {
+                Write-Host "  Warning: font copy timed out, $(@($pending).Count) file(s) may not have installed." -ForegroundColor Yellow
+            }
             Remove-Item -Path $extractPath -Recurse -Force
             Remove-Item -Path $zipFilePath -Force
             Write-Host "  ${FontDisplayName} installed." -ForegroundColor Green
@@ -119,6 +127,39 @@ function Install-NerdFonts {
     catch {
         Write-Host "  Failed to install ${FontDisplayName}: $_" -ForegroundColor Red
         return $false
+    }
+}
+
+# Download helper with retry, size validation, and corrupt-file cleanup
+function Invoke-DownloadWithRetry {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri,
+        [Parameter(Mandatory)]
+        [string]$OutFile,
+        [int]$TimeoutSec = 10,
+        [int]$MaxAttempts = 2,
+        [int]$BackoffSec = 2
+    )
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
+            Invoke-RestMethod -Uri $Uri -OutFile $OutFile -TimeoutSec $TimeoutSec -ErrorAction Stop
+            if (-not (Test-Path $OutFile) -or (Get-Item $OutFile).Length -eq 0) {
+                Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
+                throw 'Downloaded file is missing or empty'
+            }
+            return
+        }
+        catch {
+            if ($attempt -lt $MaxAttempts) {
+                Write-Host "  Download failed (attempt $attempt/$MaxAttempts): $_  Retrying in ${BackoffSec}s..." -ForegroundColor Yellow
+                Start-Sleep -Seconds $BackoffSec
+            }
+            else {
+                throw $_
+            }
+        }
     }
 }
 
@@ -141,7 +182,7 @@ if (!(Test-Path -Path $configCachePath)) {
 try {
     $configUrl = "$RepoBase/theme.json"
     $configTmp = Join-Path $env:TEMP "theme.json"
-    Invoke-RestMethod $configUrl -OutFile $configTmp -TimeoutSec 10 -ErrorAction Stop
+    Invoke-DownloadWithRetry -Uri $configUrl -OutFile $configTmp
     $profileConfig = Get-Content $configTmp -Raw | ConvertFrom-Json
     Copy-Item $configTmp (Join-Path $configCachePath "theme.json") -Force
     Remove-Item $configTmp -ErrorAction SilentlyContinue
@@ -155,7 +196,7 @@ $terminalConfig = $null
 try {
     $terminalConfigUrl = "$RepoBase/terminal-config.json"
     $terminalConfigTmp = Join-Path $env:TEMP "terminal-config.json"
-    Invoke-RestMethod $terminalConfigUrl -OutFile $terminalConfigTmp -TimeoutSec 10 -ErrorAction Stop
+    Invoke-DownloadWithRetry -Uri $terminalConfigUrl -OutFile $terminalConfigTmp
     $terminalConfig = Get-Content $terminalConfigTmp -Raw | ConvertFrom-Json
     Copy-Item $terminalConfigTmp (Join-Path $configCachePath "terminal-config.json") -Force
     Remove-Item $terminalConfigTmp -ErrorAction SilentlyContinue
@@ -175,6 +216,63 @@ function Merge-JsonObject($base, $override) {
             $base | Add-Member -NotePropertyName $prop.Name -NotePropertyValue $prop.Value -Force
         }
     }
+}
+
+# Editor candidates for interactive selection during setup
+$EditorCandidates = @(
+    @{ Cmd = 'code'; Display = 'Visual Studio Code' }
+    @{ Cmd = 'nvim'; Display = 'Neovim' }
+    @{ Cmd = 'vim'; Display = 'Vim' }
+    @{ Cmd = 'nano'; Display = 'GNU Nano' }
+    @{ Cmd = 'subl'; Display = 'Sublime Text' }
+    @{ Cmd = 'notepad++'; Display = 'Notepad++' }
+    @{ Cmd = 'notepad'; Display = 'Notepad (always available)' }
+)
+
+# Interactive editor preference prompt - returns chosen Cmd string
+function Select-PreferredEditor {
+    $defaultChoice = $null
+    Write-Host ""
+    Write-Host "  Select your preferred code editor:" -ForegroundColor Cyan
+    Write-Host ""
+    for ($i = 0; $i -lt $EditorCandidates.Count; $i++) {
+        $ed = $EditorCandidates[$i]
+        $num = $i + 1
+        $installed = [bool](Get-Command $ed.Cmd -ErrorAction SilentlyContinue)
+        if ($installed) {
+            if ($null -eq $defaultChoice) { $defaultChoice = $i }
+            Write-Host "   $num) $($ed.Display) ($($ed.Cmd)) " -NoNewline -ForegroundColor White
+            Write-Host '[installed]' -ForegroundColor Green
+        }
+        else {
+            Write-Host "   $num) $($ed.Display) ($($ed.Cmd))" -ForegroundColor DarkGray
+        }
+    }
+    if ($null -eq $defaultChoice) { $defaultChoice = 0 }
+    $defaultNum = $defaultChoice + 1
+    Write-Host ""
+    $reply = Read-Host "  Choice [$defaultNum]"
+    if ([string]::IsNullOrWhiteSpace($reply)) {
+        return $EditorCandidates[$defaultChoice].Cmd
+    }
+    $parsed = 0
+    $chosen = $null
+    if ([int]::TryParse($reply, [ref]$parsed) -and $parsed -ge 1 -and $parsed -le $EditorCandidates.Count) {
+        $chosen = $EditorCandidates[$parsed - 1]
+    }
+    else {
+        Write-Host "  Invalid choice, using default." -ForegroundColor Yellow
+        return $EditorCandidates[$defaultChoice].Cmd
+    }
+    if (-not (Get-Command $chosen.Cmd -ErrorAction SilentlyContinue)) {
+        Write-Host "  '$($chosen.Cmd)' is not installed." -ForegroundColor Yellow
+        $confirm = Read-Host "  Use anyway? [y/N]"
+        if ($confirm -notmatch '^[Yy]') {
+            Write-Host "  Using default instead." -ForegroundColor Yellow
+            return $EditorCandidates[$defaultChoice].Cmd
+        }
+    }
+    return $chosen.Cmd
 }
 
 # Apply user-settings.json overrides (never downloaded, never overwritten)
@@ -226,7 +324,7 @@ Write-Host "========================" -ForegroundColor Cyan
 Write-Host ""
 
 # Profile creation or update (install for both PS5 and PS7)
-Write-Host "[1/9] Profile" -ForegroundColor Cyan
+Write-Host "[1/10] Profile" -ForegroundColor Cyan
 $profileUrl = "$RepoBase/Microsoft.PowerShell_profile.ps1"
 # Derive Documents root from $PROFILE (works correctly even when Documents is in OneDrive)
 $docsRoot = Split-Path (Split-Path $PROFILE)
@@ -243,7 +341,7 @@ foreach ($dir in $profileDirs) {
         }
         # Download to temp first so a partial/corrupt download never overwrites the existing profile
         $tempDownload = Join-Path $env:TEMP "profile_download_$(Split-Path $dir -Leaf).ps1"
-        Invoke-RestMethod $profileUrl -OutFile $tempDownload -TimeoutSec 30 -ErrorAction Stop
+        Invoke-DownloadWithRetry -Uri $profileUrl -OutFile $tempDownload -TimeoutSec 30
         if (Test-Path -Path $targetProfile -PathType Leaf) {
             $backupPath = Join-Path $dir "oldprofile.ps1"
             Copy-Item -Path $targetProfile -Destination $backupPath -Force
@@ -259,6 +357,9 @@ foreach ($dir in $profileDirs) {
 ### profile_user.ps1 - Personal overrides (survives Update-Profile)
 ### This file is dot-sourced at the end of the main profile.
 ### Uncomment or add your own customizations below.
+
+# --- Preferred editor (used by the edit command) ---
+# $script:EditorPriority = @('code', 'notepad')
 
 # --- Custom aliases ---
 # Set-Alias -Name myalias -Value Get-ChildItem
@@ -309,6 +410,33 @@ else {
     Write-Host "  User settings file already exists at [$userSettingsTemplate] (preserved)" -ForegroundColor DarkGray
 }
 
+# Editor preference (interactive prompt writes $script:EditorPriority into profile_user.ps1)
+Write-Host "[2/10] Editor preference" -ForegroundColor Cyan
+$canPromptEditor = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AGENT_ID
+if ($canPromptEditor) { try { $null = [Console]::KeyAvailable } catch { $canPromptEditor = $false } }
+if ($canPromptEditor) {
+    $chosenEditor = Select-PreferredEditor
+    Write-Host "  Editor set to: $chosenEditor" -ForegroundColor Green
+    $editorLine = '$script:EditorPriority = @(' + "'$chosenEditor', 'notepad'" + ')'
+    foreach ($dir in $profileDirs) {
+        $userProfilePath = Join-Path $dir "profile_user.ps1"
+        if (Test-Path $userProfilePath) {
+            $content = [System.IO.File]::ReadAllText($userProfilePath)
+            if ($content -match '(?m)^\$script:EditorPriority\s*=') {
+                $content = $content -replace '(?m)^\$script:EditorPriority\s*=.*$', $editorLine
+            }
+            else {
+                $content = $content.TrimEnd() + "`r`n`r`n# --- Preferred editor (set by setup.ps1) ---`r`n$editorLine`r`n"
+            }
+            $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+            [System.IO.File]::WriteAllText($userProfilePath, $content, $utf8NoBom)
+        }
+    }
+}
+else {
+    Write-Host "  Skipped (non-interactive). Default: code, notepad" -ForegroundColor Yellow
+}
+
 # Function to download Oh My Posh theme locally
 function Install-OhMyPoshTheme {
     param (
@@ -319,9 +447,7 @@ function Install-OhMyPoshTheme {
     )
     $themeFilePath = Join-Path $configCachePath "$ThemeName.omp.json"
     try {
-        Invoke-RestMethod -Uri $ThemeUrl -OutFile $themeFilePath -TimeoutSec 10 -ErrorAction Stop
-        $themeSize = (Get-Item $themeFilePath).Length
-        if ($themeSize -eq 0) { throw "Downloaded theme file is empty" }
+        Invoke-DownloadWithRetry -Uri $ThemeUrl -OutFile $themeFilePath
         $null = Get-Content $themeFilePath -Raw | ConvertFrom-Json
         Write-Host "  Theme '$ThemeName' downloaded." -ForegroundColor Green
         return $true
@@ -359,7 +485,7 @@ function Install-WingetPackage {
 }
 
 # OMP Install
-Write-Host "[2/9] Oh My Posh" -ForegroundColor Cyan
+Write-Host "[3/10] Oh My Posh" -ForegroundColor Cyan
 $ompInstalled = Install-WingetPackage -Name "Oh My Posh" -Id "JanDeDobbeleer.OhMyPosh"
 $themeInstalled = $true
 if ($profileConfig -and $profileConfig.theme.name -and $profileConfig.theme.url) {
@@ -376,7 +502,7 @@ Get-ChildItem -Path $configCachePath -Filter "*-init.ps1" -ErrorAction SilentlyC
 Remove-Item -Force -ErrorAction SilentlyContinue
 
 # Font Install
-Write-Host "[3/9] Nerd Fonts" -ForegroundColor Cyan
+Write-Host "[4/10] Nerd Fonts" -ForegroundColor Cyan
 $fontName = "CascadiaCode"
 $fontDisplayName = "CaskaydiaCove NF"
 $fontVersion = "3.2.1"
@@ -388,18 +514,18 @@ if ($terminalConfig -and $terminalConfig.fontInstall) {
 $fontInstalled = Install-NerdFonts -FontName $fontName -FontDisplayName $fontDisplayName -Version $fontVersion
 
 # eza Install (modern ls replacement with icons and git status)
-Write-Host "[4/9] eza" -ForegroundColor Cyan
+Write-Host "[5/10] eza" -ForegroundColor Cyan
 $ezaInstalled = Install-WingetPackage -Name "eza" -Id "eza-community.eza"
 # Clean up leftover Terminal-Icons if present
 Remove-Module Terminal-Icons -Force -ErrorAction SilentlyContinue
 Uninstall-Module Terminal-Icons -AllVersions -Force -ErrorAction SilentlyContinue
 
 # zoxide Install
-Write-Host "[5/9] zoxide" -ForegroundColor Cyan
+Write-Host "[6/10] zoxide" -ForegroundColor Cyan
 $zoxideInstalled = Install-WingetPackage -Name "zoxide" -Id "ajeetdsouza.zoxide"
 
 # fzf + PSFzf Install (fuzzy finder for history and file search)
-Write-Host "[6/9] fzf" -ForegroundColor Cyan
+Write-Host "[7/10] fzf" -ForegroundColor Cyan
 $fzfInstalled = Install-WingetPackage -Name "fzf" -Id "junegunn.fzf"
 if (-not (Get-Module -ListAvailable -Name PSFzf)) {
     try {
@@ -416,15 +542,15 @@ else {
 }
 
 # bat Install (syntax-highlighted cat replacement)
-Write-Host "[7/9] bat" -ForegroundColor Cyan
+Write-Host "[8/10] bat" -ForegroundColor Cyan
 $batInstalled = Install-WingetPackage -Name "bat" -Id "sharkdp.bat"
 
 # ripgrep Install (fast recursive grep, used by the grep function)
-Write-Host "[8/9] ripgrep" -ForegroundColor Cyan
+Write-Host "[9/10] ripgrep" -ForegroundColor Cyan
 $rgInstalled = Install-WingetPackage -Name "ripgrep" -Id "BurntSushi.ripgrep.MSVC"
 
 # Windows Terminal configuration (merges font, theme, and appearance into existing settings)
-Write-Host "[9/9] Windows Terminal" -ForegroundColor Cyan
+Write-Host "[10/10] Windows Terminal" -ForegroundColor Cyan
 $wtSettingsPath = "$env:LOCALAPPDATA\Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json"
 if (Test-Path $wtSettingsPath) {
     try {
@@ -434,9 +560,34 @@ if (Test-Path $wtSettingsPath) {
         Copy-Item $wtSettingsPath $backupPath -Force
         Write-Host "  Backup saved to $backupPath" -ForegroundColor DarkGray
 
-        $wtRaw = (Get-Content $wtSettingsPath -Raw) -replace $jsoncCommentPattern, ''
-        $wt = $wtRaw | ConvertFrom-Json
+        # Cleanup old WT backups (keep last 5)
+        $wtLocalState = Split-Path $wtSettingsPath
+        $oldBackups = Get-ChildItem -Path $wtLocalState -Filter "settings.json.*.bak" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -Skip 5
+        foreach ($old in $oldBackups) {
+            Remove-Item $old.FullName -Force -ErrorAction SilentlyContinue
+        }
 
+        # Read WT settings with retry (race condition mitigation if WT is writing)
+        $wt = $null
+        for ($wtAttempt = 1; $wtAttempt -le 2; $wtAttempt++) {
+            try {
+                $wtRaw = (Get-Content $wtSettingsPath -Raw) -replace $jsoncCommentPattern, ''
+                $wt = $wtRaw | ConvertFrom-Json
+                break
+            }
+            catch {
+                if ($wtAttempt -lt 2) {
+                    Write-Host "  WT settings parse failed, retrying in 1s..." -ForegroundColor Yellow
+                    Start-Sleep -Seconds 1
+                }
+                else { throw }
+            }
+        }
+
+        if (-not $wt.profiles) {
+            $wt | Add-Member -NotePropertyName "profiles" -NotePropertyValue ([PSCustomObject]@{}) -Force
+        }
         if (-not $wt.profiles.defaults) {
             $wt.profiles | Add-Member -NotePropertyName "defaults" -NotePropertyValue ([PSCustomObject]@{}) -Force
         }
@@ -482,14 +633,14 @@ if (Test-Path $wtSettingsPath) {
         }
 
         # Ensure PowerShell profiles launch with -NoLogo to suppress
-        # the copyright banner and "Loading personal and system profiles took …" message
+        # the copyright banner and "Loading personal and system profiles took ..." message
         if ($wt.profiles.list) {
-            foreach ($prof in $wt.profiles.list) {
+            foreach ($prof in @($wt.profiles.list)) {
                 $cmd = if ($prof.commandline) { $prof.commandline } else { '' }
                 $src = if ($prof.source) { $prof.source } else { '' }
                 $isPwsh = $cmd -match 'pwsh' -or $src -match 'Windows\.Terminal\.PowerShellCore'
                 $isPS5 = $cmd -match 'powershell\.exe' -or $prof.name -match 'Windows PowerShell'
-                if (($isPwsh -or $isPS5) -and $cmd -notmatch '-NoLogo') {
+                if (($isPwsh -or $isPS5) -and $cmd -notmatch '-NoLogo' -and $cmd -notmatch '(?i)-(Command|File|EncodedCommand)') {
                     $newCmd = if ($cmd) { "$cmd -NoLogo" } elseif ($isPwsh) { "pwsh.exe -NoLogo" } else { "powershell.exe -NoLogo" }
                     $prof | Add-Member -NotePropertyName "commandline" -NotePropertyValue $newCmd -Force
                 }
@@ -547,11 +698,13 @@ else {
 Write-Host ""
 Write-Host "Restart your terminal to apply all changes." -ForegroundColor Cyan
 Write-Host ""
-if ([Environment]::UserInteractive -and -not [bool]$env:CI) {
+$canPromptExit = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AGENT_ID -and -not [bool]$env:CLAUDE_CODE
+if ($canPromptExit) { try { $null = [Console]::KeyAvailable } catch { $canPromptExit = $false } }
+if ($canPromptExit) {
     Read-Host "Press Enter to exit"
 }
-if ($MyInvocation.InvocationName -eq '.') {
-    # Dot-sourced: return instead of exit to avoid closing the session
-    return
+# Only exit when running as a standalone script file; return otherwise to avoid closing
+# the user's session when piped via irm | iex or dot-sourced.
+if ($MyInvocation.PSCommandPath) {
+    exit ([int](-not $allGood))
 }
-exit ([int](-not $allGood))

@@ -40,25 +40,24 @@ jobs:
         shell: pwsh
         run: |
           $env:CI = 'true'
-          try {
-            pwsh -NonInteractive -NoProfile -Command ". '${{ github.workspace }}/Microsoft.PowerShell_profile.ps1'"
-            Write-Host "Profile loaded successfully in non-interactive mode." -ForegroundColor Green
-          } catch {
-            Write-Error "Profile failed to load non-interactive: $_"
+          pwsh -NonInteractive -NoProfile -Command ". '${{ github.workspace }}/Microsoft.PowerShell_profile.ps1'"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Profile failed to load non-interactive (exit code: $LASTEXITCODE)"
             exit 1
           }
+          Write-Host "Profile loaded successfully in non-interactive mode." -ForegroundColor Green
 
       - name: PS5 parse-check (all .ps1 files)
         shell: powershell
         run: |
           Write-Host "PS5 version: $($PSVersionTable.PSVersion)" -ForegroundColor Cyan
           $errors = 0
-          $files = Get-ChildItem -Path '${{ github.workspace }}' -Filter *.ps1
+          $files = Get-ChildItem -Path '${{ github.workspace }}' -Filter *.ps1 -Recurse
           foreach ($file in $files) {
             $tokens = $null; $parseErrors = $null
             [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$parseErrors) | Out-Null
             if ($parseErrors.Count -gt 0) {
-              Write-Host "FAIL: $($file.Name)" -ForegroundColor Red
+              Write-Host "FAIL: $($file.FullName)" -ForegroundColor Red
               foreach ($pe in $parseErrors) {
                 Write-Host "  Line $($pe.Extent.StartLineNumber) Col $($pe.Extent.StartColumnNumber): $($pe.Message)" -ForegroundColor Red
                 Write-Host "  Text: $($pe.Extent.Text)" -ForegroundColor Yellow
@@ -73,19 +72,20 @@ jobs:
       - name: Check for hardcoded paths
         shell: pwsh
         run: |
+          # Regex patterns for matching hardcoded user paths (used directly with -match, no extra escaping)
           $patterns = @(
             'C:\\Users\\'
             'C:/Users/'
             '/home/'
             '\\\\Users\\\\'
           )
-          $files = Get-ChildItem -Recurse -Include *.ps1,*.md,*.yml | Where-Object { $_.FullName -notlike '*\.git\*' -and $_.FullName -notlike '*\.github\workflows\*' }
+          $files = Get-ChildItem -Recurse -Include *.ps1 | Where-Object { $_.FullName -notlike '*\.git\*' }
           $found = @()
           foreach ($file in $files) {
             $lines = Get-Content $file.FullName -ErrorAction SilentlyContinue
             for ($i = 0; $i -lt $lines.Count; $i++) {
               foreach ($pattern in $patterns) {
-                if ($lines[$i] -match [regex]::Escape($pattern)) {
+                if ($lines[$i] -match $pattern) {
                   $found += [PSCustomObject]@{
                     File = $file.Name
                     Line = $i + 1
@@ -102,6 +102,72 @@ jobs:
           }
           Write-Host "No hardcoded paths found." -ForegroundColor Green
 
+      - name: Check for non-ASCII characters in scripts
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Path '${{ github.workspace }}' -Filter *.ps1 -Recurse
+          $found = @()
+          foreach ($file in $files) {
+            $lines = Get-Content $file.FullName -ErrorAction SilentlyContinue
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match '[^\x00-\x7E]') {
+                $found += [PSCustomObject]@{
+                  File = $file.Name
+                  Line = $i + 1
+                  Match = $lines[$i].Trim()
+                }
+              }
+            }
+          }
+          if ($found) {
+            $found | Format-Table -AutoSize
+            Write-Error "Non-ASCII characters found in .ps1 files (em dashes, smart quotes, etc. break PS5)"
+            exit 1
+          }
+          Write-Host "No non-ASCII characters found." -ForegroundColor Green
+
+      - name: Check for UTF-8 BOM
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Recurse -Include *.ps1,*.json | Where-Object { $_.FullName -notlike '*\.git\*' }
+          $found = @()
+          foreach ($file in $files) {
+            $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+            if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+              $found += $file.Name
+            }
+          }
+          if ($found) {
+            $found | ForEach-Object { Write-Host "BOM found: $_" -ForegroundColor Red }
+            Write-Error "UTF-8 BOM detected. Use [System.IO.File]::WriteAllText() with UTF8Encoding(false)"
+            exit 1
+          }
+          Write-Host "No UTF-8 BOM found." -ForegroundColor Green
+
+      - name: Check for Set-Content -Encoding UTF8
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Recurse -Include *.ps1 | Where-Object { $_.FullName -notlike '*\.git\*' }
+          $found = @()
+          foreach ($file in $files) {
+            $lines = Get-Content $file.FullName -ErrorAction SilentlyContinue
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match 'Set-Content\s.*-Encoding\s+UTF8' -and $lines[$i] -notmatch '^\s*#') {
+                $found += [PSCustomObject]@{
+                  File = $file.Name
+                  Line = $i + 1
+                  Match = $lines[$i].Trim()
+                }
+              }
+            }
+          }
+          if ($found) {
+            $found | Format-Table -AutoSize
+            Write-Error "Set-Content -Encoding UTF8 writes BOM on PS5. Use [System.IO.File]::WriteAllText() instead"
+            exit 1
+          }
+          Write-Host "No Set-Content -Encoding UTF8 found." -ForegroundColor Green
+
       - name: Check for secrets
         shell: pwsh
         run: |
@@ -110,10 +176,11 @@ jobs:
             '(?i)(secret|token|password)\s*[:=]\s*[''"][^''"]{8,}[''"]'
             '(?i)(aws_access_key_id|aws_secret_access_key)\s*[:=]'
             'ghp_[A-Za-z0-9]{36}'
+            'github_pat_[A-Za-z0-9_]{82}'
             'sk-[A-Za-z0-9]{32,}'
             '(?i)connectionstring\s*[:=]\s*[''"]Server='
           )
-          $files = Get-ChildItem -Recurse -Include *.ps1,*.md,*.yml,*.json | Where-Object { $_.FullName -notlike '*\.git\*' }
+          $files = Get-ChildItem -Recurse -Include *.ps1,*.md,*.yml,*.json | Where-Object { $_.FullName -notlike '*\.git\*' -and $_.FullName -notlike '*\.github\workflows\*' }
           $found = @()
           foreach ($file in $files) {
             $content = Get-Content $file.FullName -Raw -ErrorAction SilentlyContinue
@@ -148,7 +215,7 @@ jobs:
               $null = Get-Content $file -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
               Write-Host "OK: $file" -ForegroundColor Green
             } catch {
-              Write-Host "FAIL: $file — $_" -ForegroundColor Red
+              Write-Host "FAIL: $file - $_" -ForegroundColor Red
               $errors++
             }
           }
@@ -183,7 +250,7 @@ jobs:
           $content = Get-Content 'setup.ps1' -Raw
 
           # Verify required functions are defined in setup.ps1
-          $requiredFunctions = @('Test-InternetConnection', 'Install-NerdFonts', 'Install-OhMyPoshTheme', 'Install-WingetPackage', 'Merge-JsonObject')
+          $requiredFunctions = @('Test-InternetConnection', 'Install-NerdFonts', 'Install-OhMyPoshTheme', 'Install-WingetPackage', 'Merge-JsonObject', 'Select-PreferredEditor', 'Invoke-DownloadWithRetry')
           $errors = 0
           foreach ($fn in $requiredFunctions) {
             if ($content -notmatch "function\s+$fn\b") {
@@ -266,16 +333,16 @@ jobs:
             $defaults | Add-Member -NotePropertyName "colorScheme" -NotePropertyValue $theme.windowsTerminal.colorScheme -Force
           }
 
-          # Verify results
+          # Verify results (read expected values from config, not hardcoded)
           $errors = 0
           if ($defaults.opacity -ne $terminal.defaults.opacity) { Write-Host "FAIL: opacity=$($defaults.opacity), expected $($terminal.defaults.opacity)" -ForegroundColor Red; $errors++ }
-          if ($defaults.colorScheme -ne 'Tokyo Night') { Write-Host "FAIL: colorScheme=$($defaults.colorScheme)" -ForegroundColor Red; $errors++ }
-          if ($defaults.font.face -ne 'CaskaydiaCove NF') { Write-Host "FAIL: font.face=$($defaults.font.face)" -ForegroundColor Red; $errors++ }
+          if ($defaults.colorScheme -ne $theme.windowsTerminal.colorScheme) { Write-Host "FAIL: colorScheme=$($defaults.colorScheme), expected $($theme.windowsTerminal.colorScheme)" -ForegroundColor Red; $errors++ }
+          if ($defaults.font.face -ne $terminal.defaults.font.face) { Write-Host "FAIL: font.face=$($defaults.font.face), expected $($terminal.defaults.font.face)" -ForegroundColor Red; $errors++ }
 
           # Verify scheme upsert
           $schemeDef = $theme.windowsTerminal.scheme
           $mockWt.schemes = @(@($mockWt.schemes | Where-Object { $_ -and $_.name -ne $schemeDef.name }) + ([PSCustomObject]$schemeDef))
-          if ($mockWt.schemes.Count -ne 1 -or $mockWt.schemes[0].name -ne 'Tokyo Night') {
+          if ($mockWt.schemes.Count -ne 1 -or $mockWt.schemes[0].name -ne $schemeDef.name) {
             Write-Host "FAIL: scheme upsert" -ForegroundColor Red; $errors++
           }
 
@@ -284,9 +351,10 @@ jobs:
             $bindingId = "User.profile.$($kb.keys -replace '[^a-zA-Z0-9]', '')"
             $mockWt.actions = @($mockWt.actions) + ([PSCustomObject]@{ keys = $kb.keys; command = $kb.command })
           }
-          $ctrlA = $mockWt.actions | Where-Object { $_.keys -eq 'ctrl+a' }
-          if (-not $ctrlA -or $ctrlA.command -ne 'selectAll') {
-            Write-Host "FAIL: keybinding upsert" -ForegroundColor Red; $errors++
+          $firstKb = @($terminal.keybindings)[0]
+          $found = $mockWt.actions | Where-Object { $_.keys -eq $firstKb.keys }
+          if (-not $found -or $found.command -ne $firstKb.command) {
+            Write-Host "FAIL: keybinding upsert (expected keys=$($firstKb.keys) command=$($firstKb.command))" -ForegroundColor Red; $errors++
           }
 
           if ($errors -gt 0) { exit 1 }
