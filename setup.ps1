@@ -487,7 +487,6 @@ function Install-WingetPackage {
 # OMP Install
 Write-Host "[3/10] Oh My Posh" -ForegroundColor Cyan
 $ompInstalled = Install-WingetPackage -Name "Oh My Posh" -Id "JanDeDobbeleer.OhMyPosh"
-$themeInstalled = $true
 if ($profileConfig -and $profileConfig.theme.name -and $profileConfig.theme.url) {
     $themeInstalled = Install-OhMyPoshTheme -ThemeName $profileConfig.theme.name -ThemeUrl $profileConfig.theme.url
 }
@@ -496,6 +495,7 @@ else {
     elseif (-not $profileConfig.theme.name) { "theme name missing" }
     else { "theme URL missing" }
     Write-Host "  Skipped theme download ($reason)." -ForegroundColor Yellow
+    $themeInstalled = $false
 }
 # Invalidate all cached init scripts so they regenerate with correct paths on next startup
 Get-ChildItem -Path $configCachePath -Filter "*-init.ps1" -ErrorAction SilentlyContinue |
@@ -640,9 +640,11 @@ if (Test-Path $wtSettingsPath) {
                 $src = if ($prof.source) { $prof.source } else { '' }
                 $isPwsh = $cmd -match 'pwsh' -or $src -match 'Windows\.Terminal\.PowerShellCore'
                 $isPS5 = $cmd -match 'powershell\.exe' -or $prof.name -match 'Windows PowerShell'
-                if (($isPwsh -or $isPS5) -and $cmd -notmatch '-NoLogo' -and $cmd -notmatch '(?i)-(Command|File|EncodedCommand)') {
-                    $newCmd = if ($cmd) { "$cmd -NoLogo" } elseif ($isPwsh) { "pwsh.exe -NoLogo" } else { "powershell.exe -NoLogo" }
-                    $prof | Add-Member -NotePropertyName "commandline" -NotePropertyValue $newCmd -Force
+                # Only modify profiles that already have an explicit commandline.
+                # Source-only profiles (no commandline) rely on WT's source resolution
+                # and adding a hardcoded commandline may break Store-installed pwsh.
+                if ($cmd -and ($isPwsh -or $isPS5) -and $cmd -notmatch '-NoLogo' -and $cmd -notmatch '(?i)-(Command|File|EncodedCommand)') {
+                    $prof | Add-Member -NotePropertyName "commandline" -NotePropertyValue "$cmd -NoLogo" -Force
                 }
             }
         }

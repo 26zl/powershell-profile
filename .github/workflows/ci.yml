@@ -1,4 +1,4 @@
-name: PSScriptAnalyzer
+name: CI
 
 on:
   push:
@@ -29,7 +29,9 @@ jobs:
             'PSUseBOMForUnicodeEncodedFile'       # Not needed
             'PSReviewUnusedParameter'             # Scriptblock params required by completer API
             'PSUseSingularNouns'                  # Style preference
-          )
+          ) | Where-Object { $_.ScriptName -ne 'ci-functional.ps1' }
+          # ci-functional.ps1 is excluded: it intentionally calls profile aliases (gc, ls, cat, uptime,
+          # eventlog) by their short names to exercise the profile's own function definitions.
           $results | Format-Table -AutoSize
           if ($results | Where-Object Severity -in 'Error','Warning') {
             Write-Error "PSScriptAnalyzer found warnings or errors"
@@ -363,3 +365,14 @@ jobs:
           $json = $mockWt | ConvertTo-Json -Depth 10
           $null = $json | ConvertFrom-Json -ErrorAction Stop
           Write-Host "OK: WT settings merge + JSON roundtrip" -ForegroundColor Green
+
+  functional:
+    runs-on: windows-latest
+    needs: [lint, install-flow]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Run functional profile tests
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File '${{ github.workspace }}/ci-functional.ps1'

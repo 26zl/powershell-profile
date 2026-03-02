@@ -37,3 +37,7 @@ profile_user.ps1
 *.tmp
 .tmpcmd.ps1
 LastExecutionTime.txt
+
+# Local test scripts
+test.ps1
+rawhunt.ps1

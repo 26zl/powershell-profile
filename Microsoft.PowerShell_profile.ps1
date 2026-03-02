@@ -470,9 +470,11 @@ function Update-Profile {
                                 $src = if ($prof.source) { $prof.source } else { '' }
                                 $isPwsh = $cmd -match 'pwsh' -or $src -match 'Windows\.Terminal\.PowerShellCore'
                                 $isPS5 = $cmd -match 'powershell\.exe' -or $prof.name -match 'Windows PowerShell'
-                                if (($isPwsh -or $isPS5) -and $cmd -notmatch '-NoLogo' -and $cmd -notmatch '(?i)-(Command|File|EncodedCommand)') {
-                                    $newCmd = if ($cmd) { "$cmd -NoLogo" } elseif ($isPwsh) { "pwsh.exe -NoLogo" } else { "powershell.exe -NoLogo" }
-                                    $prof | Add-Member -NotePropertyName "commandline" -NotePropertyValue $newCmd -Force
+                                # Only modify profiles that already have an explicit commandline.
+                                # Source-only profiles (no commandline) rely on WT's source resolution
+                                # and adding a hardcoded commandline may break Store-installed pwsh.
+                                if ($cmd -and ($isPwsh -or $isPS5) -and $cmd -notmatch '-NoLogo' -and $cmd -notmatch '(?i)-(Command|File|EncodedCommand)') {
+                                    $prof | Add-Member -NotePropertyName "commandline" -NotePropertyValue "$cmd -NoLogo" -Force
                                 }
                             }
                         }
@@ -1171,7 +1173,13 @@ if (Get-Command Remove-Alias -ErrorAction SilentlyContinue) {
 else {
     Remove-Item Alias:\gc -Force -ErrorAction SilentlyContinue
 }
-function gc { if (-not $args) { Write-Error "Usage: gc <message>"; return }; git commit -m "$args"; if ($LASTEXITCODE -ne 0) { Write-Warning "git commit failed (exit $LASTEXITCODE)" } }
+function gc {
+    if (-not $args) { Write-Error "Usage: gc <message> [git-flags]"; return }
+    $msg = $args[0]
+    $rest = @($args | Select-Object -Skip 1)
+    git commit -m $msg @rest
+    if ($LASTEXITCODE -ne 0) { Write-Warning "git commit failed (exit $LASTEXITCODE)" }
+}
 
 function gpush { git push }
 
@@ -1191,10 +1199,12 @@ function gcl { git clone @args }
 
 # Add all + commit
 function gcom {
-    if (-not $args) { Write-Error "Usage: gcom <message>"; return }
+    if (-not $args) { Write-Error "Usage: gcom <message> [git-flags]"; return }
     git add .
     if ($LASTEXITCODE -ne 0) { Write-Warning "git add failed. Commit skipped."; return }
-    git commit -m "$args"
+    $msg = $args[0]
+    $rest = @($args | Select-Object -Skip 1)
+    git commit -m $msg @rest
 }
 # Add all + commit + push
 function lazyg {
@@ -1517,6 +1527,189 @@ function Clear-ProfileCache {
     Write-Host "Profile cache cleared. Restart your terminal to regenerate." -ForegroundColor Green
 }
 
+function Uninstall-Profile {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+    param(
+        [switch]$RemoveTools,
+        [switch]$RemoveUserData,
+        [switch]$RemoveFonts,
+        [switch]$All
+    )
+
+    if ($All) { $RemoveTools = $true; $RemoveUserData = $true; $RemoveFonts = $true }
+    $preserved = @()
+
+    # Phase 1: Restore Windows Terminal settings from newest backup
+    $wtSettingsPath = Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'
+    if (Test-Path (Split-Path $wtSettingsPath)) {
+        $wtLocalState = Split-Path $wtSettingsPath
+        $backups = Get-ChildItem -Path $wtLocalState -Filter 'settings.json.*.bak' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending
+        if ($backups) {
+            $newest = $backups[0]
+            if ($PSCmdlet.ShouldProcess($wtSettingsPath, "Restore WT settings from $($newest.Name)")) {
+                Copy-Item -Path $newest.FullName -Destination $wtSettingsPath -Force
+                Write-Host "  Restored WT settings from $($newest.Name)" -ForegroundColor Green
+                # Only delete backups after a successful restore so they are not lost on a declined prompt
+                foreach ($bak in $backups) {
+                    if ($PSCmdlet.ShouldProcess($bak.FullName, 'Remove WT backup')) {
+                        Remove-Item $bak.FullName -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+        }
+    }
+
+    # Phase 2: Cache cleanup
+    $cacheDir = Join-Path $env:LOCALAPPDATA 'PowerShellProfile'
+    if (Test-Path $cacheDir) {
+        $excludes = @()
+        if (-not $RemoveUserData) { $excludes += 'user-settings.json'; $excludes += 'profile_user.ps1' }
+        $cacheItems = Get-ChildItem $cacheDir -ErrorAction SilentlyContinue |
+            Where-Object { $excludes -notcontains $_.Name }
+        foreach ($item in $cacheItems) {
+            if ($PSCmdlet.ShouldProcess($item.FullName, 'Remove cache file')) {
+                Remove-Item $item.FullName -Force -Recurse -ErrorAction SilentlyContinue
+                Write-Host "  Removed $($item.Name)" -ForegroundColor DarkGray
+            }
+        }
+        if (-not $RemoveUserData) { $preserved += 'user-settings.json (use -RemoveUserData to remove)' }
+        # Remove empty cache dir
+        $remaining = Get-ChildItem $cacheDir -ErrorAction SilentlyContinue
+        if (-not $remaining) {
+            if ($PSCmdlet.ShouldProcess($cacheDir, 'Remove empty cache directory')) {
+                Remove-Item $cacheDir -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    # Phase 3: Uninstall PSFzf module
+    if (Get-Module -ListAvailable -Name PSFzf) {
+        if ($PSCmdlet.ShouldProcess('PSFzf', 'Uninstall module')) {
+            try {
+                Uninstall-Module -Name PSFzf -AllVersions -Force -ErrorAction Stop
+                Write-Host '  Uninstalled PSFzf module.' -ForegroundColor Green
+            }
+            catch { Write-Warning "  Failed to uninstall PSFzf: $_" }
+        }
+    }
+
+    # Phase 4: Winget tools (opt-in)
+    if ($RemoveTools -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+        foreach ($tool in $script:ProfileTools) {
+            if (Get-Command $tool.Cmd -ErrorAction SilentlyContinue) {
+                if ($PSCmdlet.ShouldProcess($tool.Name, 'Uninstall via winget')) {
+                    try {
+                        winget uninstall --id $tool.Id --silent 2>$null
+                        Write-Host "  Uninstalled $($tool.Name)" -ForegroundColor Green
+                    }
+                    catch { Write-Warning "  Failed to uninstall $($tool.Name): $_" }
+                }
+            }
+        }
+    }
+    elseif (-not $RemoveTools) { $preserved += 'Managed tools (use -RemoveTools to uninstall)' }
+    elseif (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Warning '  winget not found - managed tools were not removed.'
+    }
+
+    # Phase 5: Nerd Fonts (opt-in, requires admin)
+    if ($RemoveFonts) {
+        $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        if (-not $isElevated) {
+            Write-Warning '  Font removal requires an elevated (admin) terminal. Skipping.'
+        }
+        else {
+            $fontDisplayName = 'CaskaydiaCove NF'
+            try {
+                $tcPath = Join-Path $env:LOCALAPPDATA 'PowerShellProfile\terminal-config.json'
+                if (Test-Path $tcPath) {
+                    $tc = Get-Content $tcPath -Raw | ConvertFrom-Json
+                    if ($tc.fontInstall.displayName) { $fontDisplayName = $tc.fontInstall.displayName }
+                }
+            }
+            catch { $null = $_ }
+            $fontDir = Join-Path $env:SystemRoot 'Fonts'
+            $regPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
+            $fontFiles = Get-ChildItem $fontDir -Filter '*CaskaydiaCove*NF*.ttf' -ErrorAction SilentlyContinue
+            if ($fontFiles) {
+                foreach ($f in $fontFiles) {
+                    if ($PSCmdlet.ShouldProcess($f.Name, 'Remove font file')) {
+                        Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue
+                    }
+                }
+                # Clean registry entries
+                $regEntries = Get-ItemProperty $regPath -ErrorAction SilentlyContinue
+                if ($regEntries) {
+                    $regEntries.PSObject.Properties | Where-Object { $_.Name -match 'Caskaydia' -and $_.Name -match 'NF' } | ForEach-Object {
+                        if ($PSCmdlet.ShouldProcess($_.Name, 'Remove font registry entry')) {
+                            Remove-ItemProperty -Path $regPath -Name $_.Name -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+                }
+                Write-Host "  Removed $($fontDisplayName) font files." -ForegroundColor Green
+            }
+            else {
+                Write-Host "  No Nerd Font files found to remove." -ForegroundColor DarkGray
+            }
+        }
+    }
+    else { $preserved += 'Nerd Fonts (use -RemoveFonts to remove, requires admin)' }
+
+    # Phase 6: Remove telemetry opt-out env var
+    $isElevatedNow = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if ([System.Environment]::GetEnvironmentVariable('POWERSHELL_TELEMETRY_OPTOUT', 'Machine')) {
+        if ($isElevatedNow) {
+            if ($PSCmdlet.ShouldProcess('POWERSHELL_TELEMETRY_OPTOUT', 'Remove machine environment variable')) {
+                [System.Environment]::SetEnvironmentVariable('POWERSHELL_TELEMETRY_OPTOUT', $null, [System.EnvironmentVariableTarget]::Machine)
+                Write-Host '  Removed POWERSHELL_TELEMETRY_OPTOUT env var.' -ForegroundColor Green
+            }
+        }
+        else {
+            Write-Host '  Skipping POWERSHELL_TELEMETRY_OPTOUT removal (requires admin).' -ForegroundColor DarkGray
+        }
+    }
+
+    # Phase 7: Profile files
+    $docsRoot = Split-Path (Split-Path $PROFILE)
+    $profileDirs = @(
+        Join-Path $docsRoot 'PowerShell'
+        Join-Path $docsRoot 'WindowsPowerShell'
+    )
+    foreach ($dir in $profileDirs) {
+        $mainProfile = Join-Path $dir 'Microsoft.PowerShell_profile.ps1'
+        if (Test-Path $mainProfile) {
+            if ($PSCmdlet.ShouldProcess($mainProfile, 'Remove profile file')) {
+                Remove-Item $mainProfile -Force -ErrorAction SilentlyContinue
+                Write-Host "  Removed $mainProfile" -ForegroundColor DarkGray
+            }
+        }
+        if ($RemoveUserData) {
+            $userProf = Join-Path $dir 'profile_user.ps1'
+            if (Test-Path $userProf) {
+                if ($PSCmdlet.ShouldProcess($userProf, 'Remove user profile overrides')) {
+                    Remove-Item $userProf -Force -ErrorAction SilentlyContinue
+                    Write-Host "  Removed $userProf" -ForegroundColor DarkGray
+                }
+            }
+        }
+        elseif (Test-Path (Join-Path $dir 'profile_user.ps1')) {
+            $preserved += "profile_user.ps1 in $dir (use -RemoveUserData to remove)"
+        }
+    }
+
+    # Phase 8: Summary
+    Write-Host ''
+    Write-Host 'Uninstall complete. Restart your terminal for changes to take effect.' -ForegroundColor Green
+    if ($preserved) {
+        Write-Host ''
+        Write-Host 'Preserved:' -ForegroundColor Yellow
+        foreach ($p in $preserved) { Write-Host "  - $p" -ForegroundColor DarkGray }
+        Write-Host ''
+        Write-Host 'Use Uninstall-Profile -All to remove everything.' -ForegroundColor Yellow
+    }
+}
+
 function path { $env:PATH -split ';' | Where-Object { $_ } }
 
 function weather {
@@ -1592,11 +1785,12 @@ function hosts {
     $hostsPath = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
     $editor = Resolve-PreferredEditor
     $cmdInfo = Get-Command $editor -ErrorAction SilentlyContinue
-    if ($cmdInfo -and $cmdInfo.CommandType -eq 'Application' -and $cmdInfo.Source -match '\.(cmd|bat)$') {
-        Start-Process cmd -Verb RunAs -ArgumentList "/c `"$editor`" `"$hostsPath`""
+    $editorPath = if ($cmdInfo -and $cmdInfo.Source) { $cmdInfo.Source } else { $editor }
+    if ($cmdInfo -and $cmdInfo.CommandType -eq 'Application' -and $editorPath -match '\.(cmd|bat)$') {
+        Start-Process cmd -Verb RunAs -WindowStyle Hidden -ArgumentList "/c `"$editorPath`" `"$hostsPath`""
     }
     else {
-        Start-Process $editor $hostsPath -Verb RunAs
+        Start-Process $editorPath $hostsPath -Verb RunAs
     }
 }
 
@@ -1665,7 +1859,7 @@ if (Get-Command ssh -ErrorAction SilentlyContinue) {
 
 function rdp {
     param([Parameter(Mandatory)][string]$Computer)
-    mstsc /v:$Computer
+    mstsc "/v:$Computer"
 }
 
 # Developer Utilities
@@ -2311,6 +2505,7 @@ ${g}Update-PowerShell${r} - Check for new PowerShell releases.
 ${g}Update-Tools${r} - Update Oh My Posh, eza, zoxide, fzf, bat, and ripgrep.
 ${g}Show-Help${r} - Show this help message.
 ${g}reload${r} - Reload the PowerShell profile.
+${g}Uninstall-Profile${r} - Remove profile, caches, and WT changes. Use -All for everything.
 
 ${c}Git${r}
 ${g}gs${r} - git status.  ${g}ga${r} - git add .  ${g}gc${r} <msg> - git commit -m.

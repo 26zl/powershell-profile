@@ -1,6 +1,6 @@
 # PowerShellPerfect
 
-[![PSScriptAnalyzer](https://github.com/26zl/PowerShellPerfect/actions/workflows/lint.yml/badge.svg)](https://github.com/26zl/PowerShellPerfect/actions/workflows/lint.yml)
+[![CI](https://github.com/26zl/PowerShellPerfect/actions/workflows/ci.yml/badge.svg)](https://github.com/26zl/PowerShellPerfect/actions/workflows/ci.yml)
 
 A PowerShell profile made to make a CLI nerd's life easier. Brings the Linux terminal experience to Windows - grep, cat, ls with icons, fuzzy search, zoxide, and 60+ utility commands out of the box. One command installs everything and keeps it updated. Works on both PowerShell 5.1 and 7+.
 
@@ -8,7 +8,7 @@ A PowerShell profile made to make a CLI nerd's life easier. Brings the Linux ter
 
 - **One command, fully configured** - installs 6 tools, Nerd Fonts, Oh My Posh theme, and Windows Terminal settings in one run
 - **Self-updating** - profile, theme, and terminal config sync from upstream with hash verification
-- **AI/CI sandbox safe** - detects non-interactive environments (Claude Code, GitHub Actions, SSH pipes) and suppresses network calls and UI setup automatically
+- **AI/CI sandbox safe** - detects non-interactive environments and suppresses network calls and UI setup automatically
 - **PS5 + PS7** - installs to both profile directories and handles every API difference between editions
 - **Hardened** - sensitive commands filtered from PSReadLine history; no secrets in source
 - **Fast startup** - init scripts cached to disk
@@ -58,6 +58,18 @@ Update-Tools        # Update all managed tools (Oh My Posh, eza, zoxide, fzf, ba
 
 `Update-Profile` requires hash verification by default. Confirm with `-ExpectedSha256 '<hash>'`, or use `-SkipHashCheck` to bypass. Use `-Force` to re-apply settings even when nothing changed upstream.
 
+## Uninstall
+
+Remove the profile, caches, and Windows Terminal changes:
+
+```powershell
+Uninstall-Profile              # Core cleanup: profile files, caches, WT restore, PSFzf
+Uninstall-Profile -RemoveTools # Also uninstall managed CLI tools (Oh My Posh, eza, etc.)
+Uninstall-Profile -All         # Remove everything including tools, fonts, and user data
+```
+
+Optional switches: `-RemoveTools` (winget packages), `-RemoveUserData` (profile_user.ps1, user-settings.json), `-RemoveFonts` (Nerd Fonts, requires admin), `-All` (everything). Supports `-WhatIf` to preview without making changes.
+
 ## Customization
 
 Two files survive updates and override everything:
@@ -98,6 +110,7 @@ Run `Show-Help` in your terminal for a colored version of this list.
 | `Update-Tools` | Update Oh My Posh, eza, zoxide, fzf, bat, and ripgrep |
 | `reload` | Reload the PowerShell profile |
 | `Show-Help` | Show help in terminal |
+| `Uninstall-Profile` | Remove profile, caches, and WT changes (`-All` for everything) |
 
 ### Git
 
