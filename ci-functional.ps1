@@ -248,11 +248,21 @@ Invoke-TestCase -Name 'Full install flow on host (setup.ps1)' -Code {
     }
 
     Write-Host '  Running setup.ps1 against host environment (full install flow).' -ForegroundColor Yellow
-    $setupArgs = @()
+    $setupArgs = @('-LocalRepo', $repoRoot)
     if ($isCiHost -and -not $isElevated) {
         $setupArgs += '-CiMode'
     }
     & $setupPath @setupArgs
+
+    # Verify setup actually installed files (setup.ps1 uses return, not exit 1, so
+    # $LASTEXITCODE is always 0 - we must check artifacts directly)
+    $docsRoot = Split-Path (Split-Path $PROFILE)
+    $ps7Profile = Join-Path $docsRoot 'PowerShell' 'Microsoft.PowerShell_profile.ps1'
+    $ps5Profile = Join-Path $docsRoot 'WindowsPowerShell' 'Microsoft.PowerShell_profile.ps1'
+    if (-not (Test-Path $ps7Profile)) { throw "setup.ps1 did not install PS7 profile at $ps7Profile" }
+    if (-not (Test-Path $ps5Profile)) { throw "setup.ps1 did not install PS5 profile at $ps5Profile" }
+    $cacheDir = Join-Path $env:LOCALAPPDATA 'PowerShellProfile'
+    if (-not (Test-Path $cacheDir)) { throw "setup.ps1 did not create cache dir at $cacheDir" }
 }
 
 Invoke-TestCase -Name 'Install profile in sandbox' -Code {

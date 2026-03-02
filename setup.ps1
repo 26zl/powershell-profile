@@ -11,6 +11,11 @@ param(
     [ValidateRange(6, 30)]
     [int]$FontSize = 11,
 
+    # Path to a local repo clone. When set, profile/theme.json/terminal-config.json
+    # are copied from this directory instead of downloaded from GitHub.
+    # Used by ci-functional.ps1 to test local changes without a GitHub round-trip.
+    [string]$LocalRepo = '',
+
     [switch]$CiMode
 )
 
@@ -175,8 +180,8 @@ function Invoke-DownloadWithRetry {
     }
 }
 
-# Check for internet connectivity before proceeding
-if (-not (Test-InternetConnection)) {
+# Check for internet connectivity before proceeding (skip when using a local repo)
+if (-not $LocalRepo -and -not (Test-InternetConnection)) {
     return
 }
 
@@ -192,29 +197,37 @@ if (!(Test-Path -Path $configCachePath)) {
 }
 
 try {
-    $configUrl = "$RepoBase/theme.json"
     $configTmp = Join-Path $env:TEMP "theme.json"
-    Invoke-DownloadWithRetry -Uri $configUrl -OutFile $configTmp
+    if ($LocalRepo) {
+        Copy-Item (Join-Path $LocalRepo 'theme.json') $configTmp -Force -ErrorAction Stop
+    }
+    else {
+        Invoke-DownloadWithRetry -Uri "$RepoBase/theme.json" -OutFile $configTmp
+    }
     $profileConfig = Get-Content $configTmp -Raw | ConvertFrom-Json
     Copy-Item $configTmp (Join-Path $configCachePath "theme.json") -Force
     Remove-Item $configTmp -ErrorAction SilentlyContinue
 }
 catch {
-    Write-Host "Could not download theme.json. Theme and color scheme steps will be skipped." -ForegroundColor Yellow
+    Write-Host "Could not load theme.json. Theme and color scheme steps will be skipped." -ForegroundColor Yellow
 }
 
 # Download terminal-config.json (WT behavior settings: scrollbar, historySize, keybindings)
 $terminalConfig = $null
 try {
-    $terminalConfigUrl = "$RepoBase/terminal-config.json"
     $terminalConfigTmp = Join-Path $env:TEMP "terminal-config.json"
-    Invoke-DownloadWithRetry -Uri $terminalConfigUrl -OutFile $terminalConfigTmp
+    if ($LocalRepo) {
+        Copy-Item (Join-Path $LocalRepo 'terminal-config.json') $terminalConfigTmp -Force -ErrorAction Stop
+    }
+    else {
+        Invoke-DownloadWithRetry -Uri "$RepoBase/terminal-config.json" -OutFile $terminalConfigTmp
+    }
     $terminalConfig = Get-Content $terminalConfigTmp -Raw | ConvertFrom-Json
     Copy-Item $terminalConfigTmp (Join-Path $configCachePath "terminal-config.json") -Force
     Remove-Item $terminalConfigTmp -ErrorAction SilentlyContinue
 }
 catch {
-    Write-Host "Could not download terminal-config.json. Terminal behavior settings (font, scrollbar, keybindings) will not be applied." -ForegroundColor Yellow
+    Write-Host "Could not load terminal-config.json. Terminal behavior settings (font, scrollbar, keybindings) will not be applied." -ForegroundColor Yellow
 }
 
 # Merge helper - deep-merges PSCustomObjects so nested keys are preserved
@@ -351,9 +364,14 @@ foreach ($dir in $profileDirs) {
         if (!(Test-Path -Path $dir)) {
             New-Item -Path $dir -ItemType "directory" -Force | Out-Null
         }
-        # Download to temp first so a partial/corrupt download never overwrites the existing profile
+        # Copy/download to temp first so a partial/corrupt download never overwrites the existing profile
         $tempDownload = Join-Path $env:TEMP "profile_download_$(Split-Path $dir -Leaf).ps1"
-        Invoke-DownloadWithRetry -Uri $profileUrl -OutFile $tempDownload -TimeoutSec 30
+        if ($LocalRepo) {
+            Copy-Item (Join-Path $LocalRepo 'Microsoft.PowerShell_profile.ps1') $tempDownload -Force
+        }
+        else {
+            Invoke-DownloadWithRetry -Uri $profileUrl -OutFile $tempDownload -TimeoutSec 30
+        }
         if (Test-Path -Path $targetProfile -PathType Leaf) {
             $backupPath = Join-Path $dir "oldprofile.ps1"
             Copy-Item -Path $targetProfile -Destination $backupPath -Force
