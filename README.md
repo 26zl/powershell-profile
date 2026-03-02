@@ -66,9 +66,10 @@ Remove the profile, caches, and Windows Terminal changes:
 Uninstall-Profile              # Core cleanup: profile files, caches, WT restore, PSFzf
 Uninstall-Profile -RemoveTools # Also uninstall managed CLI tools (Oh My Posh, eza, etc.)
 Uninstall-Profile -All         # Remove everything including tools, fonts, and user data
+Uninstall-Profile -All -HardResetWindowsTerminal # Same as -All, but also delete WT settings.json so WT recreates factory defaults
 ```
 
-Optional switches: `-RemoveTools` (winget packages), `-RemoveUserData` (profile_user.ps1, user-settings.json), `-RemoveFonts` (Nerd Fonts, requires admin), `-All` (everything). Supports `-WhatIf` to preview without making changes.
+Optional switches: `-RemoveTools` (winget packages), `-RemoveUserData` (profile_user.ps1, user-settings.json), `-RemoveFonts` (Nerd Fonts, requires admin), `-All` (everything), `-HardResetWindowsTerminal` (delete WT settings.json and backups so Windows Terminal recreates defaults). Supports `-WhatIf` to preview without making changes.
 
 ## Customization
 

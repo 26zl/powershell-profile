@@ -1533,19 +1533,36 @@ function Uninstall-Profile {
         [switch]$RemoveTools,
         [switch]$RemoveUserData,
         [switch]$RemoveFonts,
-        [switch]$All
+        [switch]$All,
+        [switch]$HardResetWindowsTerminal
     )
 
     if ($All) { $RemoveTools = $true; $RemoveUserData = $true; $RemoveFonts = $true }
     $preserved = @()
 
-    # Phase 1: Restore Windows Terminal settings from newest backup
+    # Phase 1: Windows Terminal settings
     $wtSettingsPath = Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'
     if (Test-Path (Split-Path $wtSettingsPath)) {
         $wtLocalState = Split-Path $wtSettingsPath
         $backups = Get-ChildItem -Path $wtLocalState -Filter 'settings.json.*.bak' -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending
-        if ($backups) {
+
+        if ($HardResetWindowsTerminal) {
+            if (Test-Path $wtSettingsPath) {
+                if ($PSCmdlet.ShouldProcess($wtSettingsPath, 'Delete WT settings for hard reset')) {
+                    Remove-Item $wtSettingsPath -Force -ErrorAction SilentlyContinue
+                    Write-Host '  Deleted Windows Terminal settings.json (WT will recreate defaults on next launch).' -ForegroundColor Green
+                }
+            }
+            if ($backups) {
+                foreach ($bak in $backups) {
+                    if ($PSCmdlet.ShouldProcess($bak.FullName, 'Remove WT backup')) {
+                        Remove-Item $bak.FullName -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+        }
+        elseif ($backups) {
             $newest = $backups[0]
             if ($PSCmdlet.ShouldProcess($wtSettingsPath, "Restore WT settings from $($newest.Name)")) {
                 Copy-Item -Path $newest.FullName -Destination $wtSettingsPath -Force
@@ -1584,8 +1601,19 @@ function Uninstall-Profile {
     }
 
     # Phase 3: Uninstall PSFzf module
+    # Note: In CI/sandbox runs (env:CI/AGENT_ID), we skip uninstalling PSFzf to avoid
+    # mutating the host user's real module installation when ci-functional.ps1 is run locally.
+    $isCiOrAgent = ($env:CI -or $env:AGENT_ID)
     if (Get-Module -ListAvailable -Name PSFzf) {
-        if ($PSCmdlet.ShouldProcess('PSFzf', 'Uninstall module')) {
+        if ($isCiOrAgent) {
+            Write-Host '  Skipping PSFzf module uninstall under CI/agent environment.' -ForegroundColor DarkGray
+        }
+        elseif ($PSCmdlet.ShouldProcess('PSFzf', 'Uninstall module')) {
+            try {
+                # Try to unload the module from the current session first
+                Remove-Module -Name PSFzf -Force -ErrorAction SilentlyContinue
+            }
+            catch { $null = $_ }
             try {
                 Uninstall-Module -Name PSFzf -AllVersions -Force -ErrorAction Stop
                 Write-Host '  Uninstalled PSFzf module.' -ForegroundColor Green
@@ -1706,7 +1734,9 @@ function Uninstall-Profile {
         Write-Host 'Preserved:' -ForegroundColor Yellow
         foreach ($p in $preserved) { Write-Host "  - $p" -ForegroundColor DarkGray }
         Write-Host ''
-        Write-Host 'Use Uninstall-Profile -All to remove everything.' -ForegroundColor Yellow
+        if (-not $All) {
+            Write-Host 'Use Uninstall-Profile -All to remove everything.' -ForegroundColor Yellow
+        }
     }
 }
 
@@ -2505,7 +2535,7 @@ ${g}Update-PowerShell${r} - Check for new PowerShell releases.
 ${g}Update-Tools${r} - Update Oh My Posh, eza, zoxide, fzf, bat, and ripgrep.
 ${g}Show-Help${r} - Show this help message.
 ${g}reload${r} - Reload the PowerShell profile.
-${g}Uninstall-Profile${r} - Remove profile, caches, and WT changes. Use -All for everything.
+${g}Uninstall-Profile${r} - Remove profile, caches, and WT changes. Use -All for everything, -HardResetWindowsTerminal to reset WT to defaults.
 
 ${c}Git${r}
 ${g}gs${r} - git status.  ${g}ga${r} - git add .  ${g}gc${r} <msg> - git commit -m.

@@ -9,15 +9,24 @@ param(
     [string]$ColorScheme,
 
     [ValidateRange(6, 30)]
-    [int]$FontSize = 11
+    [int]$FontSize = 11,
+
+    [switch]$CiMode
 )
 
 $RepoBase = "https://raw.githubusercontent.com/26zl/PowerShellPerfect/main"
 
-# Ensure the script can run with elevated privileges
-if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+$isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
+$isCiHost = $CiMode -or [bool]$env:GITHUB_ACTIONS -or [bool]$env:CI
+
+# Ensure the script can run with elevated privileges for local installs.
+# In CI/non-admin mode we continue and skip admin-only steps instead of exiting.
+if (-not $isElevated -and -not $isCiHost) {
     Write-Host "Please run this script as an Administrator!" -ForegroundColor Red
     return
+}
+elseif (-not $isElevated -and $isCiHost) {
+    Write-Host "Running setup.ps1 in CI/non-admin mode. Admin-only steps (LocalMachine execution policy, system-wide font install) will be skipped." -ForegroundColor Yellow
 }
 
 # Set execution policy so the profile can load on future sessions
@@ -26,23 +35,26 @@ if ($currentUserPolicy -in @('Restricted', 'AllSigned', 'Undefined')) {
     Set-ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
     Write-Host "Execution policy set to RemoteSigned for CurrentUser." -ForegroundColor Green
 }
-# Offer LocalMachine scope (covers all users and both PS editions) but don't force it
-$machinePolicy = Get-ExecutionPolicy -Scope LocalMachine
-if ($machinePolicy -in @('Restricted', 'AllSigned', 'Undefined')) {
-    $canPrompt = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AGENT_ID
-    if ($canPrompt) { try { $null = [Console]::KeyAvailable } catch { $canPrompt = $false } }
-    if ($canPrompt) {
-        $reply = Read-Host "  LocalMachine execution policy is '$machinePolicy'. Set to RemoteSigned for all users? [y/N]"
-        if ($reply -match '^[Yy]') {
-            Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
-            Write-Host "Execution policy set to RemoteSigned for LocalMachine." -ForegroundColor Green
+# Offer LocalMachine scope (covers all users and both PS editions) but don't force it.
+# In CI/non-admin mode we skip this prompt entirely.
+if (-not $isCiHost) {
+    $machinePolicy = Get-ExecutionPolicy -Scope LocalMachine
+    if ($machinePolicy -in @('Restricted', 'AllSigned', 'Undefined')) {
+        $canPrompt = [Environment]::UserInteractive -and -not [bool]$env:CI -and -not [bool]$env:AGENT_ID
+        if ($canPrompt) { try { $null = [Console]::KeyAvailable } catch { $canPrompt = $false } }
+        if ($canPrompt) {
+            $reply = Read-Host "  LocalMachine execution policy is '$machinePolicy'. Set to RemoteSigned for all users? [y/N]"
+            if ($reply -match '^[Yy]') {
+                Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
+                Write-Host "Execution policy set to RemoteSigned for LocalMachine." -ForegroundColor Green
+            }
+            else {
+                Write-Host "  Skipped LocalMachine policy. PS5 may not load the profile if CurrentUser is overridden." -ForegroundColor Yellow
+            }
         }
         else {
-            Write-Host "  Skipped LocalMachine policy. PS5 may not load the profile if CurrentUser is overridden." -ForegroundColor Yellow
+            Write-Host "  Skipped LocalMachine policy prompt (non-interactive mode)." -ForegroundColor Yellow
         }
-    }
-    else {
-        Write-Host "  Skipped LocalMachine policy prompt (non-interactive mode)." -ForegroundColor Yellow
     }
 }
 

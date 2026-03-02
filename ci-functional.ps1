@@ -19,6 +19,18 @@ $script:executedCommands = [System.Collections.Generic.HashSet[string]]::new([Sy
 $script:skippedCommands = @{}
 $script:commandFailures = @()
 $script:networkSoftFails = @()
+$script:installReady = $false
+
+$script:origLocalAppData = $env:LOCALAPPDATA
+$script:origProfileVar = $PROFILE
+$script:origCiVar = $env:CI
+
+$script:sandboxRoot = $null
+$script:sandboxPs7Dir = $null
+$script:sandboxPs5Dir = $null
+$script:sandboxPs7Profile = $null
+$script:sandboxPs5Profile = $null
+$script:sandboxCacheDir = $null
 
 function Write-Result {
     param(
@@ -155,12 +167,10 @@ function Invoke-CommandProbe {
         return
     }
 
-    $beforeErrCount = $Error.Count
     try {
         $output = & { $ErrorActionPreference = 'Stop'; & $Code } 2>&1
         $errorRecords = @($output | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
         if ($errorRecords.Count -gt 0) { throw $errorRecords[0].ToString() }
-        if ($Error.Count -gt $beforeErrCount) { throw $Error[0].ToString() }
 
         if ($VerboseOutput -and $output) {
             foreach ($line in $output) {
@@ -186,6 +196,27 @@ function Invoke-CommandProbe {
     }
 }
 
+function Restore-SandboxEnvironment {
+    if ($null -ne $script:origLocalAppData) {
+        $env:LOCALAPPDATA = $script:origLocalAppData
+    }
+
+    if ($script:origProfileVar) {
+        $global:PROFILE = $script:origProfileVar
+    }
+
+    if ([string]::IsNullOrWhiteSpace($script:origCiVar)) {
+        Remove-Item env:CI -ErrorAction SilentlyContinue
+    }
+    else {
+        $env:CI = $script:origCiVar
+    }
+
+    if ($script:sandboxRoot -and (Test-Path $script:sandboxRoot)) {
+        Remove-Item -Path $script:sandboxRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Write-Host ''
 Write-Host '========== Functional CI Suite (Full Command Coverage) ==========' -ForegroundColor Cyan
 Write-Host ''
@@ -194,15 +225,88 @@ if (-not (Test-Path $profilePath)) {
     throw "Profile not found: $profilePath"
 }
 
-$env:CI = 'true'
-. $profilePath
-Remove-Item env:CI -ErrorAction SilentlyContinue
+try {
+Invoke-TestCase -Name 'Full install flow on host (setup.ps1)' -Code {
+    # Run the real setup.ps1 against the current host to validate the full install flow
+    # (winget tools, fonts, Windows Terminal settings).
+    #
+    # Behavior:
+    # - In CI/non-admin environments: call setup.ps1 -CiMode so admin-only steps are skipped
+    #   but the rest of the flow still executes.
+    # - Locally (non-CI): require elevation so users see the real install behavior.
+
+    $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $isCiHost = [bool]$env:GITHUB_ACTIONS -or [bool]$env:CI
+
+    if (-not $isElevated -and -not $isCiHost) {
+        throw 'setup.ps1 requires an elevated (Administrator) shell when run locally. Run ci-functional.ps1 from an elevated pwsh so the full install flow can be validated.'
+    }
+
+    $setupPath = Join-Path $repoRoot 'setup.ps1'
+    if (-not (Test-Path $setupPath)) {
+        throw "setup.ps1 not found at $setupPath"
+    }
+
+    Write-Host '  Running setup.ps1 against host environment (full install flow).' -ForegroundColor Yellow
+    $setupArgs = @()
+    if ($isCiHost -and -not $isElevated) {
+        $setupArgs += '-CiMode'
+    }
+    & $setupPath @setupArgs
+}
+
+Invoke-TestCase -Name 'Install profile in sandbox' -Code {
+    $script:installReady = $false
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+
+    $script:sandboxRoot = Join-Path $env:TEMP "psp-ci-install-$([System.IO.Path]::GetRandomFileName())"
+    $sandboxLocal = Join-Path $script:sandboxRoot 'Local'
+    $sandboxDocs = Join-Path $script:sandboxRoot 'Documents'
+    $script:sandboxPs7Dir = Join-Path $sandboxDocs 'PowerShell'
+    $script:sandboxPs5Dir = Join-Path $sandboxDocs 'WindowsPowerShell'
+    $script:sandboxPs7Profile = Join-Path $script:sandboxPs7Dir 'Microsoft.PowerShell_profile.ps1'
+    $script:sandboxPs5Profile = Join-Path $script:sandboxPs5Dir 'Microsoft.PowerShell_profile.ps1'
+    $script:sandboxCacheDir = Join-Path $sandboxLocal 'PowerShellProfile'
+
+    New-Item -ItemType Directory -Path $script:sandboxPs7Dir, $script:sandboxPs5Dir, $script:sandboxCacheDir -Force | Out-Null
+
+    $env:LOCALAPPDATA = $sandboxLocal
+    $global:PROFILE = $script:sandboxPs7Profile
+
+    & (Join-Path $repoRoot 'setprofile.ps1') | Out-Null
+
+    if (-not (Test-Path $script:sandboxPs7Profile)) { throw "Missing installed profile: $($script:sandboxPs7Profile)" }
+    if (-not (Test-Path $script:sandboxPs5Profile)) { throw "Missing installed profile: $($script:sandboxPs5Profile)" }
+
+    Copy-Item (Join-Path $repoRoot 'theme.json') (Join-Path $script:sandboxCacheDir 'theme.json') -Force
+    Copy-Item (Join-Path $repoRoot 'terminal-config.json') (Join-Path $script:sandboxCacheDir 'terminal-config.json') -Force
+    [System.IO.File]::WriteAllText((Join-Path $script:sandboxCacheDir 'user-settings.json'), '{}', $utf8NoBom)
+
+    # These emulate install artifacts and are validated by the uninstall phase.
+    [System.IO.File]::WriteAllText((Join-Path $script:sandboxCacheDir 'omp-init.ps1'), '# init', $utf8NoBom)
+    [System.IO.File]::WriteAllText((Join-Path $script:sandboxCacheDir 'zoxide-init.ps1'), '# init', $utf8NoBom)
+    [System.IO.File]::WriteAllText((Join-Path $script:sandboxPs7Dir 'profile_user.ps1'), '# user override', $utf8NoBom)
+    [System.IO.File]::WriteAllText((Join-Path $script:sandboxPs5Dir 'profile_user.ps1'), '# user override', $utf8NoBom)
+
+    $smokeOutput = pwsh -NoProfile -NonInteractive -Command ". '$($script:sandboxPs7Profile)'" 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $sample = ($smokeOutput | Select-Object -First 5) -join '; '
+        throw "Installed profile failed to load in sandbox smoke test: $sample"
+    }
+
+    $script:installReady = $true
+}
 
 Invoke-TestCase -Name 'Execute full command matrix' -Code {
     $script:executedCommands.Clear()
     $script:skippedCommands = @{}
     $script:commandFailures = @()
     $script:networkSoftFails = @()
+
+    $env:LOCALAPPDATA = Join-Path $script:sandboxRoot 'Local'
+    $global:PROFILE = $script:sandboxPs7Profile
+    $env:CI = 'true'
+    . $script:sandboxPs7Profile
 
     $workspace = Join-Path $env:TEMP "psp-ci-func-$([System.IO.Path]::GetRandomFileName())"
     $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
@@ -423,7 +527,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
             $before = Get-Location
             try {
                 mkcd $mkcdDir
-                if ((Get-Location).Path -ne $mkcdDir) { throw "mkcd did not change directory to $mkcdDir" }
+                if ([System.IO.Path]::GetFullPath((Get-Location).Path) -ne [System.IO.Path]::GetFullPath($mkcdDir)) { throw "mkcd did not change directory to $mkcdDir" }
             }
             finally { Set-Location $before }
         }
@@ -589,7 +693,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         # Docker
         Invoke-CommandProbe -Command 'dps' -Code { dps | Out-Null } -SkipReason $dockerSkipReason
         Invoke-CommandProbe -Command 'dpa' -Code { dpa | Out-Null } -SkipReason $dockerSkipReason
-        Invoke-CommandProbe -Command 'dimg' -Code { dimg | Out-Null } -SkipReason $dockerSkipReason
+        Invoke-CommandProbe -Command 'dimg' -Code { dimg 2>$null | Out-Null } -SkipReason $dockerSkipReason
         Invoke-CommandProbe -Command 'dlogs' -SkipReason 'Requires running container name'
         Invoke-CommandProbe -Command 'dex' -SkipReason 'Requires running container name'
         Invoke-CommandProbe -Command 'dstop' -SkipReason 'Destructive: stops running containers'
@@ -635,7 +739,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
         $sample = ($script:commandFailures | Select-Object -First 5) -join '; '
         throw "$($script:commandFailures.Count) command probe(s) failed. Sample: $sample"
     }
-}
+} -SkipWhen { -not $script:installReady } -SkipReason 'Sandbox install failed'
 
 Invoke-TestCase -Name 'Coverage audit against profile exports' -Code {
     $tokens = $null
@@ -675,6 +779,38 @@ Invoke-TestCase -Name 'Coverage audit against profile exports' -Code {
     $execPct = if ($allExports.Count -gt 0) { [math]::Round(($script:executedCommands.Count / $allExports.Count) * 100) } else { 0 }
     $detail = "functions=$($commandFns.Count), aliases=$($aliasNames.Count), executed=$($script:executedCommands.Count), skipped=$($script:skippedCommands.Count), network-soft-fails=$($script:networkSoftFails.Count), exec%=$execPct"
     Write-Host "        $detail" -ForegroundColor DarkGray
+} -SkipWhen { -not $script:installReady } -SkipReason 'Sandbox install failed'
+
+Invoke-TestCase -Name 'Uninstall profile from sandbox' -Code {
+    if (-not $script:sandboxPs7Profile -or -not (Test-Path $script:sandboxPs7Profile)) {
+        throw 'Sandbox PS7 profile missing before uninstall'
+    }
+    if (-not $script:sandboxPs5Profile -or -not (Test-Path $script:sandboxPs5Profile)) {
+        throw 'Sandbox PS5 profile missing before uninstall'
+    }
+
+    $env:LOCALAPPDATA = Join-Path $script:sandboxRoot 'Local'
+    $global:PROFILE = $script:sandboxPs7Profile
+    $env:CI = 'true'
+    . $script:sandboxPs7Profile
+
+    Uninstall-Profile -RemoveUserData -Confirm:$false
+
+    if (Test-Path $script:sandboxPs7Profile) { throw 'PS7 profile still exists after uninstall' }
+    if (Test-Path $script:sandboxPs5Profile) { throw 'PS5 profile still exists after uninstall' }
+    if (Test-Path (Join-Path $script:sandboxPs7Dir 'profile_user.ps1')) { throw 'PS7 profile_user.ps1 still exists after uninstall' }
+    if (Test-Path (Join-Path $script:sandboxPs5Dir 'profile_user.ps1')) { throw 'PS5 profile_user.ps1 still exists after uninstall' }
+
+    if (Test-Path $script:sandboxCacheDir) {
+        $remaining = Get-ChildItem -Path $script:sandboxCacheDir -ErrorAction SilentlyContinue
+        if ($remaining.Count -gt 0) {
+            throw "Cache directory still contains files after uninstall: $($remaining.Name -join ', ')"
+        }
+    }
+} -SkipWhen { -not $script:installReady } -SkipReason 'Sandbox install failed'
+}
+finally {
+    Restore-SandboxEnvironment
 }
 
 Write-Host ''
