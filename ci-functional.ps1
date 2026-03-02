@@ -248,9 +248,12 @@ Invoke-TestCase -Name 'Full install flow on host (setup.ps1)' -Code {
     }
 
     Write-Host '  Running setup.ps1 against host environment (full install flow).' -ForegroundColor Yellow
-    $setupArgs = @('-LocalRepo', $repoRoot)
+    # Hashtable splatting is required for named parameters.
+    # Array splatting passes elements positionally, which would bind '-LocalRepo'
+    # to the first positional param ($Opacity) and fail the int conversion.
+    $setupArgs = @{ LocalRepo = $repoRoot }
     if ($isCiHost -and -not $isElevated) {
-        $setupArgs += '-CiMode'
+        $setupArgs['CiMode'] = $true
     }
     & $setupPath @setupArgs
 
