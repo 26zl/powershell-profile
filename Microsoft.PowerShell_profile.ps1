@@ -2425,6 +2425,17 @@ if ($isInteractive) {
             }
             catch { Write-Verbose "Failed to parse user-settings.json: $_" }
         }
+        # Recovery: if theme.json is missing (cache cleared or cleaning program), re-download it
+        if (-not $themeName) {
+            try {
+                $configUrl = "$repo_root/$repo_name/main/theme.json"
+                Invoke-RestMethod -Uri $configUrl -OutFile $profileConfigPath -TimeoutSec 5 -ErrorAction Stop
+                $cfg = Get-Content $profileConfigPath -Raw | ConvertFrom-Json
+                if ($cfg.theme.name) { $themeName = $cfg.theme.name }
+                if ($cfg.theme.url) { $themeUrl = $cfg.theme.url }
+            }
+            catch { Write-Verbose "Could not recover theme.json from repo: $_" }
+        }
         if (-not $themeName) {
             Write-Verbose "No theme.json found in cache. Run Update-Profile or setup.ps1 to configure the OMP theme."
         }
@@ -2451,9 +2462,9 @@ if ($isInteractive) {
             }
         }
         if ($localThemePath -and (Test-Path $localThemePath)) {
-            # Ensure OMP always uses our theme, even if its internal cache is invalidated
-            $env:POSH_THEME = $localThemePath
-            # Cache the OMP init script so we don't shell out every startup
+            # Resolve OMP's internal cache directory (used for stale cache cleanup below)
+            $ompInternalDir = (Resolve-Path (Join-Path $env:LOCALAPPDATA 'Packages\ohmyposh.cli_*\LocalCache\Local\oh-my-posh') -ErrorAction SilentlyContinue | Select-Object -First 1).Path
+            # Cache the OMP init script so we don't shell out every startup.
             # Header tracks both OMP version AND theme path so a theme switch invalidates the cache.
             # PERF: Defer `oh-my-posh version` (~2-3s) until we know the cache is missing/stale.
             # When the cache exists, validate using only the theme path portion of the header
@@ -2463,13 +2474,31 @@ if ($isInteractive) {
             if (Test-Path $ompCachePath) {
                 $fileSize = (Get-Item $ompCachePath).Length
                 if ($fileSize -gt 0) {
-                    $cacheContent = Get-Content $ompCachePath -First 1
-                    # Fast check: just verify the header references the correct theme path
-                    if ($cacheContent -match '^# OMP_CACHE: .+ \| ' -and $cacheContent.EndsWith($localThemePath)) {
-                        $cacheValid = $true
+                    $cacheContent = Get-Content $ompCachePath -Raw
+                    $firstLine = ($cacheContent -split "`n", 2)[0]
+                    # Fast check: verify header references correct theme path
+                    if ($firstLine -match '^# OMP_CACHE: .+ \| ' -and $firstLine.EndsWith($localThemePath)) {
+                        # Also verify that the OMP internal init file referenced in the cache still exists.
+                        # Cleaning programs (CCleaner, BleachBit) often wipe LocalCache directories,
+                        # deleting OMP's internal init script and breaking the cached redirect.
+                        $ompInternalPath = [regex]::Match($cacheContent, "& '([^']+)'").Groups[1].Value
+                        if ($ompInternalPath -and (Test-Path -LiteralPath $ompInternalPath)) {
+                            $cacheValid = $true
+                        }
                     }
                 }
-                if (-not $cacheValid) { Remove-Item $ompCachePath -Force -ErrorAction SilentlyContinue }
+                if (-not $cacheValid) {
+                    Remove-Item $ompCachePath -Force -ErrorAction SilentlyContinue
+                    # OMP bakes the theme into its binary cache (omp.cache) during `init --config`.
+                    # POSH_THEME env var is NOT respected by `print primary` - only --config during init matters.
+                    # When our cache is invalid (cleaner wiped the internal init file, or theme changed),
+                    # clear all OMP binary/session caches so the regenerated init bakes in the correct theme.
+                    if ($ompInternalDir) {
+                        Remove-Item (Join-Path $ompInternalDir 'omp.cache') -Force -ErrorAction SilentlyContinue
+                        Get-ChildItem $ompInternalDir -Filter 'pwsh.*.omp.cache' -ErrorAction SilentlyContinue |
+                            Remove-Item -Force -ErrorAction SilentlyContinue
+                    }
+                }
             }
             if (-not $cacheValid) {
                 # Only pay the cost of `oh-my-posh version` when we need to regenerate the cache
