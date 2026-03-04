@@ -2451,6 +2451,8 @@ if ($isInteractive) {
             }
         }
         if ($localThemePath -and (Test-Path $localThemePath)) {
+            # Ensure OMP always uses our theme, even if its internal cache is invalidated
+            $env:POSH_THEME = $localThemePath
             # Cache the OMP init script so we don't shell out every startup
             # Header tracks both OMP version AND theme path so a theme switch invalidates the cache.
             # PERF: Defer `oh-my-posh version` (~2-3s) until we know the cache is missing/stale.
