@@ -26,9 +26,7 @@ irm "https://github.com/26zl/PowerShellPerfect/raw/main/setup.ps1" | iex
 
 The terminal restarts automatically when setup finishes (new tab in Windows Terminal, or new window otherwise). For the best experience use [PowerShell 7](https://github.com/PowerShell/PowerShell).
 
-> **Recommended for Oh My Posh:** Install the x64 MSI release manually instead of relying on `winget`/Store (`WindowsApps`/MSIX). This repo preserves a direct MSI install and avoids the WindowsApps path when possible.
-
-If Oh My Posh is already installed directly via MSI, setup preserves that install instead of forcing it back through the WindowsApps/MSIX path.
+> **Recommended for Oh My Posh:** Install the x64 MSI from the [releases](https://github.com/JanDeDobbeleer/oh-my-posh/releases) page (see [Oh My Posh](https://github.com/JanDeDobbeleer/oh-my-posh)) instead of `winget`/Store—this profile preserves a direct install and avoids the WindowsApps path. If you already have the MSI install, setup leaves it as is.
 
 ### Manual Setup
 
@@ -68,12 +66,12 @@ Remove the profile, caches, and Windows Terminal changes:
 
 ```powershell
 Uninstall-Profile              # Core cleanup: profile files, caches, WT restore, PSFzf
-Uninstall-Profile -RemoveTools # Also uninstall managed CLI tools (Oh My Posh, eza, etc.)
+Uninstall-Profile -RemoveTools # Also uninstall managed CLI tools (including direct/MSI Oh My Posh when detected)
 Uninstall-Profile -All         # Remove everything including tools, fonts, and user data
 Uninstall-Profile -All -HardResetWindowsTerminal # Same as -All, but also delete WT settings.json so WT recreates factory defaults
 ```
 
-Optional switches: `-RemoveTools` (winget packages), `-RemoveUserData` (profile_user.ps1, user-settings.json), `-RemoveFonts` (Nerd Fonts, requires admin), `-All` (everything), `-HardResetWindowsTerminal` (delete WT settings.json and backups so Windows Terminal recreates defaults). Supports `-WhatIf` to preview without making changes.
+Optional switches: `-RemoveTools` (winget-managed tools plus direct/MSI Oh My Posh when registered as MSI), `-RemoveUserData` (profile_user.ps1, user-settings.json), `-RemoveFonts` (Nerd Fonts, requires admin), `-All` (everything), `-HardResetWindowsTerminal` (delete WT settings.json and backups so Windows Terminal recreates defaults). Supports `-WhatIf` to preview without making changes.
 
 ## Customization
 

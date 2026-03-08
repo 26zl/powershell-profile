@@ -113,9 +113,20 @@ function Get-ExternalCommandPath {
 
     $cmd = Get-Command $CommandName -ErrorAction SilentlyContinue
     if (-not $cmd) { return $null }
-    if ($cmd.Path) { return $cmd.Path }
-    if ($cmd.Source) { return $cmd.Source }
-    if ($cmd.Definition) { return $cmd.Definition }
+
+    if ($cmd.CommandType -eq 'Alias' -and $cmd.Definition -and $cmd.Definition -ne $CommandName) {
+        return Get-ExternalCommandPath -CommandName $cmd.Definition
+    }
+
+    $pathCandidates = @($cmd.Path, $cmd.Source, $cmd.Definition) |
+        Where-Object { $_ -and [System.IO.Path]::IsPathRooted([string]$_) } |
+        Select-Object -Unique
+    foreach ($pathCandidate in $pathCandidates) {
+        if (Test-Path -LiteralPath $pathCandidate -PathType Leaf) {
+            return $pathCandidate
+        }
+    }
+
     return $null
 }
 
@@ -140,11 +151,6 @@ function Merge-JsonObject {
 
 # Specific helper to get the path to oh-my-posh executable for cache clearing (since it has a built-in cache clear command instead of a file-based cache)
 function Get-OhMyPoshExecutablePath {
-    $resolvedPath = Get-ExternalCommandPath -CommandName 'oh-my-posh'
-    if ($resolvedPath) {
-        return $resolvedPath
-    }
-
     $candidatePaths = @(
         (Join-Path $env:LOCALAPPDATA 'Programs\oh-my-posh\bin\oh-my-posh.exe'),
         (Join-Path $env:LOCALAPPDATA 'Programs\oh-my-posh\oh-my-posh.exe'),
@@ -154,6 +160,12 @@ function Get-OhMyPoshExecutablePath {
     $pf86 = [System.Environment]::GetEnvironmentVariable('ProgramFiles(x86)', 'Process')
     if ($pf86) {
         $candidatePaths += (Join-Path $pf86 'oh-my-posh\bin\oh-my-posh.exe')
+    }
+
+    $resolvedPath = Get-ExternalCommandPath -CommandName 'oh-my-posh'
+    $windowsAppsRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'
+    if ($resolvedPath -and $resolvedPath -notlike "$windowsAppsRoot*") {
+        return $resolvedPath
     }
 
     foreach ($candidatePath in ($candidatePaths | Select-Object -Unique)) {
@@ -187,6 +199,47 @@ function Get-OhMyPoshInstallInfo {
         Path        = $path
         InstallKind = $installKind
     }
+}
+
+function Test-WingetPackageInstalled {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Id
+    )
+
+    $wingetPath = Get-ExternalCommandPath -CommandName 'winget'
+    if (-not $wingetPath) { return $false }
+
+    try {
+        $wingetOutput = @(& $wingetPath list --id $Id --exact 2>&1)
+        $wingetText = (@($wingetOutput) -join [Environment]::NewLine).Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $wingetText) { return $false }
+        if ($wingetText -match 'No installed package found') { return $false }
+        return $wingetText -match [regex]::Escape($Id)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-OhMyPoshMsiProductCode {
+    $roots = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+
+    $entries = Get-ItemProperty -Path $roots -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -eq 'Oh My Posh' }
+    foreach ($entry in $entries) {
+        foreach ($uninstallString in @($entry.QuietUninstallString, $entry.UninstallString)) {
+            if ($uninstallString -and $uninstallString -match '\{[0-9A-Fa-f\-]{36}\}') {
+                return $Matches[0]
+            }
+        }
+    }
+
+    return $null
 }
 
 # Resolve executable path for a profile tool (OMP uses Get-OhMyPoshInstallInfo, others use Get-Command)
@@ -2274,17 +2327,49 @@ function Uninstall-Profile {
         }
     }
 
-    # Phase 4: Winget tools (opt-in)
-    if ($RemoveTools -and (Get-Command winget -ErrorAction SilentlyContinue)) {
+    # Phase 4: Managed tools (winget by default, direct/MSI aware for Oh My Posh)
+    if ($RemoveTools) {
         if ($isCiOrAgent) {
             Write-Host '  Skipping managed tool uninstall under CI/agent environment.' -ForegroundColor DarkGray
         }
         else {
+            $wingetPath = Get-ExternalCommandPath -CommandName 'winget'
             foreach ($tool in $script:ProfileTools) {
-                if (Get-Command $tool.Cmd -ErrorAction SilentlyContinue) {
+                $toolPath = Get-ProfileToolExecutablePath -Tool $tool
+                $wingetManaged = if ($wingetPath) { Test-WingetPackageInstalled -Id $tool.Id } else { $false }
+                $removalMode = $null
+                $ompMsiProductCode = $null
+
+                if ($tool.Cmd -eq 'oh-my-posh') {
+                    if ($wingetManaged) {
+                        $removalMode = 'winget'
+                    }
+                    else {
+                        $ompMsiProductCode = Get-OhMyPoshMsiProductCode
+                    }
+
+                    if ($ompMsiProductCode) {
+                        $removalMode = 'msi'
+                    }
+                }
+                elseif ($wingetManaged) {
+                    $removalMode = 'winget'
+                }
+
+                if (-not $removalMode) {
+                    if ($toolPath) {
+                        $toolLocation = if (-not $wingetPath -and $tool.Cmd -ne 'oh-my-posh') { 'install present but winget is unavailable' }
+                        elseif ($tool.Cmd -eq 'oh-my-posh') { 'direct/MSI install without winget registration' }
+                        else { 'local install without winget registration' }
+                        Write-Host "  Preserving $($tool.Name) ($toolLocation)." -ForegroundColor DarkGray
+                    }
+                    continue
+                }
+
+                if ($removalMode -eq 'winget') {
                     if ($PSCmdlet.ShouldProcess($tool.Name, 'Uninstall via winget')) {
                         try {
-                            $wingetOutput = @(& winget uninstall -e --id $tool.Id --silent 2>&1)
+                            $wingetOutput = @(& $wingetPath uninstall -e --id $tool.Id --silent 2>&1)
                             if ($LASTEXITCODE -eq 0) {
                                 Write-Host "  Uninstalled $($tool.Name)" -ForegroundColor Green
                             }
@@ -2298,14 +2383,34 @@ function Uninstall-Profile {
                             Write-Warning "  Failed to uninstall $($tool.Name): $_"
                         }
                     }
+                    continue
+                }
+
+                if ($removalMode -eq 'msi') {
+                    if (-not $ompMsiProductCode) {
+                        Write-Warning '  Could not locate an MSI product code for Oh My Posh.'
+                        continue
+                    }
+
+                    if ($PSCmdlet.ShouldProcess($tool.Name, 'Uninstall via MSI')) {
+                        try {
+                            $msiProc = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/x', $ompMsiProductCode, '/qn', '/norestart') -Wait -PassThru -WindowStyle Hidden
+                            if ($msiProc.ExitCode -in @(0, 1605, 3010)) {
+                                Write-Host "  Uninstalled $($tool.Name)" -ForegroundColor Green
+                            }
+                            else {
+                                Write-Warning "  Failed to uninstall $($tool.Name) via MSI (exit $($msiProc.ExitCode))."
+                            }
+                        }
+                        catch {
+                            Write-Warning "  Failed to uninstall $($tool.Name) via MSI: $_"
+                        }
+                    }
                 }
             }
         }
     }
     elseif (-not $RemoveTools) { $preserved += 'Managed tools (use -RemoveTools to uninstall)' }
-    elseif (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-        Write-Warning '  winget not found - managed tools were not removed.'
-    }
 
     # Phase 5: Nerd Fonts (opt-in, requires admin)
     if ($RemoveFonts) {

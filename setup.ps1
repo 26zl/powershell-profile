@@ -188,11 +188,6 @@ function Invoke-DownloadWithRetry {
 
 # Resolve oh-my-posh executable path (Get-Command or known install locations)
 function Get-OhMyPoshExecutablePath {
-    $cmd = Get-Command oh-my-posh -ErrorAction SilentlyContinue
-    if ($cmd -and $cmd.Path) {
-        return $cmd.Path
-    }
-
     $candidatePaths = @(
         (Join-Path $env:LOCALAPPDATA 'Programs\oh-my-posh\bin\oh-my-posh.exe'),
         (Join-Path $env:LOCALAPPDATA 'Programs\oh-my-posh\oh-my-posh.exe'),
@@ -202,6 +197,13 @@ function Get-OhMyPoshExecutablePath {
     $pf86 = [System.Environment]::GetEnvironmentVariable('ProgramFiles(x86)', 'Process')
     if ($pf86) {
         $candidatePaths += (Join-Path $pf86 'oh-my-posh\bin\oh-my-posh.exe')
+    }
+
+    $cmd = Get-Command oh-my-posh -ErrorAction SilentlyContinue
+    $resolvedPath = if ($cmd -and $cmd.Path -and (Test-Path -LiteralPath $cmd.Path -PathType Leaf)) { $cmd.Path } else { $null }
+    $windowsAppsRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'
+    if ($resolvedPath -and $resolvedPath -notlike "$windowsAppsRoot*") {
+        return $resolvedPath
     }
 
     foreach ($candidatePath in ($candidatePaths | Select-Object -Unique)) {

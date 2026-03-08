@@ -780,9 +780,11 @@ Invoke-TestCase -Name 'Coverage audit against profile exports' -Code {
     $internalOnly = @(
         'Get-ExternalCommandPath'
         'Get-OhMyPoshInstallInfo'
+        'Get-OhMyPoshMsiProductCode'
         'Get-OhMyPoshExecutablePath'
         'Get-ProfileToolExecutablePath'
         'Get-ProfileToolVersionText'
+        'Test-WingetPackageInstalled'
         'Invoke-OhMyPoshCommand'
         'Get-OhMyPoshPromptContext'
         'Get-OhMyPoshPromptText'
