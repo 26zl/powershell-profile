@@ -2900,6 +2900,8 @@ ${g}Update-PowerShell${r} - Check for new PowerShell releases.
 ${g}Update-Tools${r} - Update Oh My Posh, eza, zoxide, fzf, bat, and ripgrep.
 ${g}Show-Help${r} - Show this help message.
 ${g}reload${r} - Reload the PowerShell profile.
+${g}Clear-ProfileCache${r} - Reset profile caches plus OMP internal caches.
+${g}Clear-Cache${r} [-IncludeSystemCaches] - Clear user/system temp caches.
 ${g}Uninstall-Profile${r} - Remove profile, caches, and WT changes. Use -All for everything, -HardResetWindowsTerminal to reset WT to defaults.
 
 ${c}Git${r}
@@ -2947,8 +2949,6 @@ ${g}weather${r} [city] - Quick weather lookup.
 ${g}speedtest${r} - Download speed test.
 ${g}wifipass${r} [ssid] - Show saved WiFi passwords.
 ${g}hosts${r} - Open hosts file in elevated editor.
-${g}Clear-Cache${r} [-IncludeSystemCaches] - Clear user/system caches.
-${g}Clear-ProfileCache${r} - Reset profile caches plus OMP internal caches.
 ${g}winutil${r} - Launch Chris Titus WinUtil.
 ${g}harden${r} - Open Harden Windows Security.
 

@@ -181,8 +181,8 @@ Run `Show-Help` in your terminal for a colored version of this list.
 | `speedtest` | Download speed test |
 | `wifipass [ssid]` | Show saved WiFi passwords |
 | `hosts` | Open hosts file in elevated editor |
-| `Clear-Cache` | Clear user temp/browser caches |
-| `Clear-ProfileCache` | Reset all profile caches |
+| `Clear-Cache` [-IncludeSystemCaches] | Clear user temp/browser caches (optionally system dirs) |
+| `Clear-ProfileCache` | Reset profile caches plus OMP internal caches |
 | `winutil` | Launch [Chris Titus WinUtil](https://github.com/ChrisTitusTech/winutil) |
 | `harden` | Open [Harden Windows Security](https://github.com/HotCakeX/Harden-Windows-Security) |
 
@@ -207,10 +207,10 @@ Run `Show-Help` in your terminal for a colored version of this list.
 | --- | --- |
 | `killport <port>` | Kill process on a TCP port |
 | `http <url> [-Method POST] [-Body '...']` | HTTP requests, auto-formats JSON |
-| `prettyjson <file>` | Pretty-print JSON |
+| `prettyjson <file>` | Pretty-print JSON (accepts pipeline input) |
 | `hb <file>` | Upload to hastebin, copy URL |
 | `timer { command }` | Measure execution time |
-| `watch { command } [-Interval n]` | Repeat command every n seconds (like Linux watch) |
+| `watch { command } [-Interval n]` | Repeat command every n seconds (default 2; like Linux watch) |
 | `bak <file>` | Quick timestamped backup |
 
 ### Docker (when installed)
