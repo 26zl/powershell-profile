@@ -32,6 +32,7 @@ $script:sandboxPs7Profile = $null
 $script:sandboxPs5Profile = $null
 $script:sandboxCacheDir = $null
 
+# Write test result (PASS/FAIL/SKIP) and update counters
 function Write-Result {
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -57,6 +58,7 @@ function Write-Result {
     }
 }
 
+# Run a test case with optional skip predicate
 function Invoke-TestCase {
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -99,12 +101,14 @@ function Invoke-TestCase {
     }
 }
 
+# Register command as executed for coverage audit
 function Register-ExecutedCommand {
     param([Parameter(Mandatory)][string]$Name)
     if ($script:skippedCommands.ContainsKey($Name)) { $script:skippedCommands.Remove($Name) }
     [void]$script:executedCommands.Add($Name)
 }
 
+# Register command as skipped with reason for coverage audit
 function Register-SkippedCommand {
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -115,6 +119,7 @@ function Register-SkippedCommand {
     }
 }
 
+# Detect if error message indicates a network/connectivity issue (for soft-fail in probes)
 function Test-IsNetworkIssue {
     param([string]$Message)
     if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
@@ -148,6 +153,7 @@ function Test-IsNetworkIssue {
     return $false
 }
 
+# Run a single command probe and record result for coverage audit
 function Invoke-CommandProbe {
     param(
         [Parameter(Mandatory)][string]$Command,
@@ -196,13 +202,14 @@ function Invoke-CommandProbe {
     }
 }
 
+# Restore environment and remove sandbox dir after test run
 function Restore-SandboxEnvironment {
     if ($null -ne $script:origLocalAppData) {
         $env:LOCALAPPDATA = $script:origLocalAppData
     }
 
     if ($script:origProfileVar) {
-        $global:PROFILE = $script:origProfileVar
+        Set-Variable -Name PROFILE -Scope Global -Value $script:origProfileVar
     }
 
     if ([string]::IsNullOrWhiteSpace($script:origCiVar)) {
@@ -284,7 +291,7 @@ Invoke-TestCase -Name 'Install profile in sandbox' -Code {
     New-Item -ItemType Directory -Path $script:sandboxPs7Dir, $script:sandboxPs5Dir, $script:sandboxCacheDir -Force | Out-Null
 
     $env:LOCALAPPDATA = $sandboxLocal
-    $global:PROFILE = $script:sandboxPs7Profile
+    Set-Variable -Name PROFILE -Scope Global -Value $script:sandboxPs7Profile
 
     & (Join-Path $repoRoot 'setprofile.ps1') | Out-Null
 
@@ -317,7 +324,7 @@ Invoke-TestCase -Name 'Execute full command matrix' -Code {
     $script:networkSoftFails = @()
 
     $env:LOCALAPPDATA = Join-Path $script:sandboxRoot 'Local'
-    $global:PROFILE = $script:sandboxPs7Profile
+    Set-Variable -Name PROFILE -Scope Global -Value $script:sandboxPs7Profile
     $env:CI = 'true'
     . $script:sandboxPs7Profile
 
@@ -770,7 +777,15 @@ Invoke-TestCase -Name 'Coverage audit against profile exports' -Code {
         ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
 
     # Internal helper functions that are not direct end-user commands
-    $internalOnly = @('Merge-JsonObject', 'Invoke-DownloadWithRetry')
+    $internalOnly = @(
+        'Get-ExternalCommandPath'
+        'Get-OhMyPoshExecutablePath'
+        'Merge-JsonObject'
+        'Invoke-DownloadWithRetry'
+        'Invoke-WithTimeout'
+        'Restart-TerminalToApply'
+        'Clear-OhMyPoshCaches'
+    )
     $commandFns = $allFns | Where-Object { $internalOnly -notcontains $_ }
 
     $coveredNames = @([string[]]$script:executedCommands + [string[]]$script:skippedCommands.Keys) | Sort-Object -Unique
@@ -805,7 +820,7 @@ Invoke-TestCase -Name 'Uninstall profile from sandbox' -Code {
     }
 
     $env:LOCALAPPDATA = Join-Path $script:sandboxRoot 'Local'
-    $global:PROFILE = $script:sandboxPs7Profile
+    Set-Variable -Name PROFILE -Scope Global -Value $script:sandboxPs7Profile
     $env:CI = 'true'
     . $script:sandboxPs7Profile
 

@@ -267,8 +267,9 @@ jobs:
       - name: Test Merge-JsonObject logic
         shell: pwsh
         run: |
-          # Extract Merge-JsonObject from setup.ps1 and test it
+          # Extract Merge-JsonObject from setup.ps1 and test it (with null guard like production)
           function Merge-JsonObject($base, $override) {
+            if (-not $base -or -not $override) { return }
             foreach ($prop in $override.PSObject.Properties) {
               $baseVal = $base.PSObject.Properties[$prop.Name]
               if ($baseVal -and $baseVal.Value -is [PSCustomObject] -and $prop.Value -is [PSCustomObject]) {
@@ -308,6 +309,13 @@ jobs:
             exit 1
           }
           Write-Host "OK: object replacement" -ForegroundColor Green
+
+          # Test 4: null base or override returns without throwing (matches production guard)
+          $base = [PSCustomObject]@{ a = 1 }
+          Merge-JsonObject $null $base
+          Merge-JsonObject $base $null
+          if ($base.a -ne 1) { Write-Error "Null guard should not modify base"; exit 1 }
+          Write-Host "OK: null guard" -ForegroundColor Green
 
       - name: Test WT settings merge (mock)
         shell: pwsh

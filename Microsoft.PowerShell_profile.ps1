@@ -33,7 +33,7 @@ if ($isAdmin -and -not [System.Environment]::GetEnvironmentVariable('POWERSHELL_
 # Cache: init-script filename in $cacheDir that must be deleted when the tool is upgraded (or $null).
 # VerCmd: argument(s) to get the tool version for pre/post-upgrade display.
 $script:ProfileTools = @(
-    @{ Name = "Oh My Posh"; Id = "JanDeDobbeleer.OhMyPosh"; Cmd = "oh-my-posh"; Cache = "omp-init.ps1"; VerCmd = "version" }
+    @{ Name = "Oh My Posh"; Id = "JanDeDobbeleer.OhMyPosh"; Cmd = "oh-my-posh"; Cache = $null; VerCmd = "version" }
     @{ Name = "eza"; Id = "eza-community.eza"; Cmd = "eza"; Cache = $null; VerCmd = "--version" }
     @{ Name = "zoxide"; Id = "ajeetdsouza.zoxide"; Cmd = "zoxide"; Cache = "zoxide-init.ps1"; VerCmd = "--version" }
     @{ Name = "fzf"; Id = "junegunn.fzf"; Cmd = "fzf"; Cache = $null; VerCmd = "--version" }
@@ -41,7 +41,8 @@ $script:ProfileTools = @(
     @{ Name = "ripgrep"; Id = "BurntSushi.ripgrep.MSVC"; Cmd = "rg"; Cache = $null; VerCmd = "--version" }
 )
 
-# Run a scriptblock in a job with timeout; returns result or $null on timeout/failure (avoids OMP/zoxide init hangs)
+# Run a scriptblock in a job with timeout; returns result or $null on timeout/failure.
+# Used for native init commands where we want an explicit timeout but can pass a resolved exe path.
 function Invoke-WithTimeout {
     param(
         [Parameter(Mandatory)]
@@ -99,6 +100,74 @@ function Invoke-DownloadWithRetry {
     }
 }
 
+# Get the full path to an external command
+function Get-ExternalCommandPath {
+    param(
+        [Parameter(Mandatory)]
+        [string]$CommandName
+    )
+
+    $cmd = Get-Command $CommandName -ErrorAction SilentlyContinue
+    if (-not $cmd) { return $null }
+    if ($cmd.Path) { return $cmd.Path }
+    if ($cmd.Source) { return $cmd.Source }
+    if ($cmd.Definition) { return $cmd.Definition }
+    return $null
+}
+
+# Specific helper to get the path to oh-my-posh executable for cache clearing (since it has a built-in cache clear command instead of a file-based cache)
+function Get-OhMyPoshExecutablePath {
+    Get-ExternalCommandPath -CommandName 'oh-my-posh'
+}
+
+# Clear oh-my-posh cache by either deleting legacy cache files or invoking the built-in cache clear command (if available).
+# Legacy cache files are detected by a special comment in the first line and are removed if found. The built-in command is used if the executable is available, and any errors during cache clearing are logged as warnings.
+function Clear-OhMyPoshCaches {
+    param(
+        [switch]$Quiet
+    )
+
+    $docRoot = [Environment]::GetFolderPath('MyDocuments')
+    $legacyCachePaths = @(
+        (Join-Path $env:LOCALAPPDATA 'PowerShellProfile\omp-init.ps1')
+        (Join-Path $docRoot 'PowerShell\omp-init.ps1')
+        (Join-Path $docRoot 'WindowsPowerShell\omp-init.ps1')
+    ) | Select-Object -Unique
+
+    foreach ($legacyPath in $legacyCachePaths) {
+        if (-not (Test-Path $legacyPath)) { continue }
+        try {
+            $firstLine = Get-Content $legacyPath -TotalCount 1 -ErrorAction Stop
+            if ($firstLine -match '^# OMP_CACHE') {
+                Remove-Item $legacyPath -Force -ErrorAction SilentlyContinue
+                if (-not $Quiet) {
+                    Write-Host "  Removed legacy OMP init cache: $legacyPath" -ForegroundColor DarkGray
+                }
+            }
+        }
+        catch {
+            if (-not $Quiet) {
+                Write-Verbose "Failed to inspect/remove legacy OMP init cache '$legacyPath': $_"
+            }
+        }
+    }
+
+    $ompExecutablePath = Get-OhMyPoshExecutablePath
+    if ($ompExecutablePath) {
+        try {
+            & $ompExecutablePath cache clear | Out-Null
+            if ($LASTEXITCODE -ne 0 -and -not $Quiet) {
+                Write-Warning "oh-my-posh cache clear exited with code $LASTEXITCODE."
+            }
+        }
+        catch {
+            if (-not $Quiet) {
+                Write-Warning "Failed to clear oh-my-posh cache: $_"
+            }
+        }
+    }
+}
+
 # Check for Profile Updates (manual only)
 function Update-Profile {
     [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
@@ -112,9 +181,18 @@ function Update-Profile {
     $tempProfile = Join-Path $env:TEMP "Microsoft.PowerShell_profile.ps1"
     $tempConfig = Join-Path $env:TEMP "theme.json"
     $tempTerminalConfig = Join-Path $env:TEMP "terminal-config.json"
+    $userSettingsPath = Join-Path $cacheDir "user-settings.json"
+    $userSettingsStatePath = Join-Path $cacheDir "user-settings.applied.sha256"
 
     $phaseErrors = @()
     $profileActuallyUpdated = $false
+    $userSettingsHash = $null
+    $userSettingsChanged = $false
+    $userSettingsParsed = $false
+    $userThemeOverridePresent = $false
+    $userWindowsTerminalOverridePresent = $false
+    $userTerminalDefaultsOverridePresent = $false
+    $userKeybindingsOverridePresent = $false
     try {
         # Phase 1: Download profile and config
         $profileUrl = "$repo_root/$repo_name/main/Microsoft.PowerShell_profile.ps1"
@@ -165,7 +243,25 @@ function Update-Profile {
             $terminalConfigChanged = $newTerminalConfigHash -ne $oldTerminalConfigHash
         }
 
-        if (-not $profileChanged -and -not $configChanged -and -not $terminalConfigChanged -and -not $Force) {
+        if (Test-Path $userSettingsPath) {
+            try {
+                $userSettingsHash = (Get-FileHash -Path $userSettingsPath -Algorithm SHA256).Hash
+                $appliedUserSettingsHash = if (Test-Path $userSettingsStatePath) {
+                    (Get-Content $userSettingsStatePath -Raw -ErrorAction Stop).Trim()
+                }
+                else {
+                    ""
+                }
+                $userSettingsChanged = $userSettingsHash -ne $appliedUserSettingsHash
+            }
+            catch {
+                Write-Warning "Could not fingerprint user-settings.json: $_"
+                $phaseErrors += "user-settings fingerprint: $_"
+                $userSettingsChanged = $true
+            }
+        }
+
+        if (-not $profileChanged -and -not $configChanged -and -not $terminalConfigChanged -and -not $userSettingsChanged -and -not $Force) {
             Write-Host "Profile is up to date." -ForegroundColor Green
             return
         }
@@ -292,10 +388,14 @@ function Update-Profile {
         }
 
         # Apply user-settings.json overrides (never downloaded, never overwritten)
-        $userSettingsPath = Join-Path $cacheDir "user-settings.json"
         if (Test-Path $userSettingsPath) {
             try {
                 $userSettings = Get-Content $userSettingsPath -Raw | ConvertFrom-Json
+                $userSettingsParsed = $true
+                $userThemeOverridePresent = $null -ne $userSettings.theme
+                $userWindowsTerminalOverridePresent = $null -ne $userSettings.windowsTerminal
+                $userTerminalDefaultsOverridePresent = $null -ne $userSettings.defaults
+                $userKeybindingsOverridePresent = $null -ne $userSettings.keybindings
                 if ($config -and $userSettings.theme) {
                     if (-not $config.theme) {
                         $config | Add-Member -NotePropertyName "theme" -NotePropertyValue ([PSCustomObject]@{}) -Force
@@ -351,29 +451,68 @@ function Update-Profile {
             $themeName = $config.theme.name
             $themeUrl = $config.theme.url
             $localThemePath = Join-Path $cacheDir "$themeName.omp.json"
-            $shouldDownloadTheme = (-not (Test-Path $localThemePath)) -or $profileChanged -or $configChanged
+            $currentThemeReady = $false
+            if (Test-Path $localThemePath) {
+                try {
+                    $existingThemeContent = Get-Content $localThemePath -Raw -ErrorAction Stop
+                    if ([string]::IsNullOrWhiteSpace($existingThemeContent)) { throw 'Theme file is empty' }
+                    $null = $existingThemeContent | ConvertFrom-Json
+                    $currentThemeReady = $true
+                }
+                catch {
+                    Write-Warning "Existing OMP theme '$themeName' is invalid at '$localThemePath': $_"
+                }
+            }
+
+            $themeOverrideChanged = $userSettingsChanged -and $userThemeOverridePresent
+            $shouldDownloadTheme = $Force -or (-not $currentThemeReady) -or $configChanged -or $themeOverrideChanged
             if ($shouldDownloadTheme -and $themeUrl) {
                 if ($PSCmdlet.ShouldProcess($localThemePath, "Download OMP theme '$themeName'")) {
+                    $tempThemePath = Join-Path $cacheDir ("{0}.{1}.download" -f $themeName, [System.IO.Path]::GetRandomFileName())
                     try {
-                        Invoke-DownloadWithRetry -Uri $themeUrl -OutFile $localThemePath
-                        $null = Get-Content $localThemePath -Raw | ConvertFrom-Json
+                        Invoke-DownloadWithRetry -Uri $themeUrl -OutFile $tempThemePath
+                        $downloadedThemeContent = Get-Content $tempThemePath -Raw -ErrorAction Stop
+                        if ([string]::IsNullOrWhiteSpace($downloadedThemeContent)) { throw 'Downloaded theme file is empty' }
+                        $null = $downloadedThemeContent | ConvertFrom-Json
+                        Move-Item -Path $tempThemePath -Destination $localThemePath -Force
                         Write-Host "OMP theme '$themeName' updated." -ForegroundColor Green
+                        $currentThemeReady = $true
                     }
                     catch {
                         Write-Warning "Failed to download/validate OMP theme: $_"
                         $phaseErrors += "OMP theme download: $_"
-                        Remove-Item $localThemePath -Force -ErrorAction SilentlyContinue
+                    }
+                    finally {
+                        Remove-Item $tempThemePath -Force -ErrorAction SilentlyContinue
                     }
                 }
             }
+            elseif ($shouldDownloadTheme -and -not $themeUrl -and -not $currentThemeReady) {
+                Write-Warning "OMP theme '$themeName' is missing locally and no download URL is configured."
+                $phaseErrors += "OMP theme missing URL: $themeName"
+            }
 
             # Orphan cleanup - remove *.omp.json files that don't match current theme
-            $ompFiles = Get-ChildItem -Path $cacheDir -Filter "*.omp.json" -ErrorAction SilentlyContinue
-            foreach ($file in $ompFiles) {
-                if ($file.Name -ne "$themeName.omp.json") {
-                    if ($PSCmdlet.ShouldProcess($file.FullName, "Remove orphaned OMP theme")) {
-                        Remove-Item $file.FullName -Force -ErrorAction SilentlyContinue
-                        Write-Host "Removed orphaned theme: $($file.Name)" -ForegroundColor DarkGray
+            if (-not $currentThemeReady -and (Test-Path $localThemePath)) {
+                try {
+                    $currentThemeContent = Get-Content $localThemePath -Raw -ErrorAction Stop
+                    if ([string]::IsNullOrWhiteSpace($currentThemeContent)) { throw 'Theme file is empty' }
+                    $null = $currentThemeContent | ConvertFrom-Json
+                    $currentThemeReady = $true
+                }
+                catch {
+                    Write-Warning "Skipping orphan cleanup because current OMP theme '$themeName' is still invalid: $_"
+                }
+            }
+
+            if ($currentThemeReady) {
+                $ompFiles = Get-ChildItem -Path $cacheDir -Filter "*.omp.json" -ErrorAction SilentlyContinue
+                foreach ($file in $ompFiles) {
+                    if ($file.Name -ne "$themeName.omp.json") {
+                        if ($PSCmdlet.ShouldProcess($file.FullName, "Remove orphaned OMP theme")) {
+                            Remove-Item $file.FullName -Force -ErrorAction SilentlyContinue
+                            Write-Host "Removed orphaned theme: $($file.Name)" -ForegroundColor DarkGray
+                        }
                     }
                 }
             }
@@ -395,7 +534,8 @@ function Update-Profile {
         }
 
         # Phase 6: Windows Terminal sync
-        if (($Force -or $profileChanged -or $configChanged -or $terminalConfigChanged) -and (($config -and $config.windowsTerminal) -or $terminalConfig)) {
+        $terminalOverridesChanged = $userSettingsChanged -and ($userWindowsTerminalOverridePresent -or $userTerminalDefaultsOverridePresent -or $userKeybindingsOverridePresent)
+        if (($Force -or $profileChanged -or $configChanged -or $terminalConfigChanged -or $terminalOverridesChanged) -and (($config -and $config.windowsTerminal) -or $terminalConfig)) {
             $wtSettingsPath = Join-Path $env:LOCALAPPDATA "Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json"
             if (Test-Path $wtSettingsPath) {
                 if ($PSCmdlet.ShouldProcess($wtSettingsPath, "Update Windows Terminal settings")) {
@@ -581,6 +721,19 @@ function Update-Profile {
                 Copy-Item -Path $tempTerminalConfig -Destination $cachedTerminalConfig -Force
             }
         }
+        if (Test-Path $userSettingsPath) {
+            if ($userSettingsParsed -and $userSettingsHash -and $phaseErrors.Count -eq 0) {
+                if ($PSCmdlet.ShouldProcess($userSettingsStatePath, 'Save applied user-settings fingerprint')) {
+                    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+                    [System.IO.File]::WriteAllText($userSettingsStatePath, $userSettingsHash, $utf8NoBom)
+                }
+            }
+        }
+        elseif (Test-Path $userSettingsStatePath) {
+            if ($PSCmdlet.ShouldProcess($userSettingsStatePath, 'Remove stale user-settings fingerprint')) {
+                Remove-Item $userSettingsStatePath -Force -ErrorAction SilentlyContinue
+            }
+        }
 
         # Error summary
         if ($phaseErrors.Count -gt 0) {
@@ -747,6 +900,7 @@ function Clear-Cache {
 
 # Admin Check and Prompt Customization (fallback when Oh My Posh is not loaded)
 $adminSuffix = if ($isAdmin) { " [ADMIN]" } else { "" }
+# PowerShell prompt (fallback when Oh My Posh is not loaded)
 function prompt {
     if ($adminSuffix) { "[" + (Get-Location) + "] # " } else { "[" + (Get-Location) + "] $ " }
 }
@@ -759,6 +913,7 @@ if ($null -eq $script:EditorPriority) {
 }
 $script:ResolvedEditor = $null
 
+# Resolve preferred editor from EditorPriority or env EDITOR (used by edit/Edit-Profile)
 function Resolve-PreferredEditor {
     if ($script:ResolvedEditor -and (Get-Command $script:ResolvedEditor -CommandType Application -ErrorAction SilentlyContinue)) {
         return $script:ResolvedEditor
@@ -779,6 +934,7 @@ function Resolve-PreferredEditor {
     return $script:ResolvedEditor
 }
 
+# Open files with preferred editor (alias: edit)
 function edit {
     $editor = Resolve-PreferredEditor
     & $editor @args
@@ -833,6 +989,7 @@ function winutil {
     }
 }
 
+# Launch Harden Windows Security (hss.exe) if installed
 function harden {
     if (Get-Command "hss.exe" -ErrorAction SilentlyContinue) {
         Start-Process "hss.exe"
@@ -869,6 +1026,7 @@ function Get-SystemBootTime {
     }
 }
 
+# Display system boot time and uptime
 function uptime {
     try {
         $bootTime = Get-SystemBootTime
@@ -1187,6 +1345,7 @@ function docs {
     Set-Location -Path $docs
 }
 
+# Change directory to Desktop
 function dtop {
     $dtop = [Environment]::GetFolderPath("Desktop")
     if ([string]::IsNullOrWhiteSpace($dtop)) { $dtop = $HOME + "\Desktop" }
@@ -1202,6 +1361,7 @@ if (Get-Command eza -ErrorAction SilentlyContinue) {
     else {
         Remove-Item Alias:\ls -Force -ErrorAction SilentlyContinue
     }
+    # ls/la/ll/lt: directory listing via eza (icons, git status, tree)
     function ls { eza --icons @args }
     function la { eza -a --icons @args }
     function ll { eza -la --icons --git @args }
@@ -1209,6 +1369,7 @@ if (Get-Command eza -ErrorAction SilentlyContinue) {
 }
 else {
     if ($isInteractive) { Write-Warning "eza not found. Install it with: winget install -e --id eza-community.eza" }
+    # Fallback listing when eza not installed
     function la { Get-ChildItem -Force | Format-Table -AutoSize }
     function ll { Get-ChildItem -Force | Format-Table Mode, LastWriteTime, Length, Name -AutoSize }
     function lt { Get-ChildItem -Recurse -Depth 2 | Format-Table -AutoSize }
@@ -1223,6 +1384,7 @@ if (Get-Command bat -ErrorAction SilentlyContinue) {
     else {
         Remove-Item Alias:\cat -Force -ErrorAction SilentlyContinue
     }
+    # cat: syntax-highlighted output via bat (no paging)
     function cat { bat --paging=never @args }
 }
 else {
@@ -1232,6 +1394,7 @@ else {
 # Git Shortcuts
 function gs { git status }
 
+# Git add all
 function ga { git add .; if ($LASTEXITCODE -ne 0) { Write-Warning "git add failed (exit $LASTEXITCODE)" } }
 
 # Remove built-in gc alias (Get-Content) so our function is reachable
@@ -1241,6 +1404,7 @@ if (Get-Command Remove-Alias -ErrorAction SilentlyContinue) {
 else {
     Remove-Item Alias:\gc -Force -ErrorAction SilentlyContinue
 }
+# Git commit with message
 function gc {
     if (-not $args) { Write-Error "Usage: gc <message> [git-flags]"; return }
     $msg = $args[0]
@@ -1249,8 +1413,10 @@ function gc {
     if ($LASTEXITCODE -ne 0) { Write-Warning "git commit failed (exit $LASTEXITCODE)" }
 }
 
+# Remove built-in gp alias (Get-Process) so our function is reachable
 function gpush { git push }
 
+# Remove built-in gl alias (Get-ChildItem) so our function is reachable
 function gpull { git pull }
 
 # Jump to github directory via zoxide
@@ -1263,6 +1429,7 @@ function g {
     }
 }
 
+# Git clone shortcut
 function gcl { git clone @args }
 
 # Add all + commit
@@ -1312,6 +1479,7 @@ function ports {
     }
 }
 
+# Check if a specific port is open on a host (defaults to localhost)
 function checkport {
     param(
         [Parameter(Mandatory)][string]$Hostname,
@@ -1326,6 +1494,7 @@ function checkport {
     }
 }
 
+# List local IPv4 addresses (excluding loopback and APIPA)
 function localip {
     Get-NetIPAddress -AddressFamily IPv4 |
     Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.PrefixOrigin -ne 'WellKnown' } |
@@ -1333,6 +1502,7 @@ function localip {
     Format-Table -AutoSize
 }
 
+# DNS Lookup (defaults to A record, specify type with -Type)
 function nslook {
     param(
         [Parameter(Mandatory)][string]$Domain,
@@ -1351,6 +1521,7 @@ function hash {
     (Get-FileHash -LiteralPath $File -Algorithm $Algorithm).Hash
 }
 
+# Verify file integrity by comparing computed hash to expected value (auto-detects algorithm by length)
 function checksum {
     param(
         [Parameter(Mandatory)][string]$File,
@@ -1376,6 +1547,7 @@ function checksum {
     }
 }
 
+# Generate a random password of specified length (default 20) and copy to clipboard
 function genpass {
     param([ValidateRange(1, 1024)][int]$Length = 20)
     $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+[]{}|;:,.<>?'
@@ -1406,17 +1578,20 @@ function genpass {
     return $password
 }
 
+# Base64 encode/decode
 function b64 {
     param([Parameter(Mandatory)][string]$Text)
     [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Text))
 }
 
+# Base64 decode with error handling
 function b64d {
     param([Parameter(Mandatory)][string]$Text)
     try { [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Text)) }
     catch { Write-Error "Invalid Base64 input: $_" }
 }
 
+# VirusTotal file scanner (PS5-compatible, no dependencies)
 function vtscan {
     param([Parameter(Mandatory)][string]$FilePath)
     $apiKey = if ($env:VTCLI_APIKEY) { $env:VTCLI_APIKEY } elseif ($env:VT_API_KEY) { $env:VT_API_KEY } else { $null }
@@ -1528,6 +1703,7 @@ function vtscan {
 }
 
 if (-not (Get-Command vt.exe -ErrorAction SilentlyContinue)) {
+    # Fallback when vt-cli not installed: show install instructions
     function vt {
         Write-Host 'vt-cli is not installed. Install with:' -ForegroundColor Red
         Write-Host '  winget install VirusTotal.vt-cli' -ForegroundColor Yellow
@@ -1537,9 +1713,11 @@ if (-not (Get-Command vt.exe -ErrorAction SilentlyContinue)) {
 
 # Docker Shortcuts (conditional)
 if (Get-Command docker -ErrorAction SilentlyContinue) {
+    # dps/dpa/dimg: list containers and images
     function dps { docker ps @args }
     function dpa { docker ps -a @args }
     function dimg { docker images @args }
+    # dlogs: follow container logs; dex: exec into container
     function dlogs {
         param([Parameter(Mandatory)][string]$Container)
         docker logs -f $Container
@@ -1551,6 +1729,7 @@ if (Get-Command docker -ErrorAction SilentlyContinue) {
         )
         docker exec -it $Container $Shell
     }
+    # dstop: stop all running containers; dprune: system prune
     function dstop {
         $running = docker ps -q
         if ($running) { docker stop $running } else { Write-Host "No running containers." }
@@ -1572,7 +1751,7 @@ function svc {
         catch { Write-Error "Failed to query system info: $_"; return }
         $totalMem = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
         $usedMem = [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1MB, 1)
-        $memPct = [math]::Round($usedMem / $totalMem * 100)
+        $memPct = if ($totalMem -gt 0) { [math]::Round($usedMem / $totalMem * 100) } else { 0 }
         $cpuLoad = try { [math]::Round((Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average) } catch { 0 }
         $procCount = @(Get-Process).Count
         $up = (Get-Date) - $bootTime
@@ -1596,20 +1775,33 @@ function svc {
     } while ($Live)
 }
 
+# Reload profile in current session (useful after editing profile_user.ps1 or user-settings.json)
 function reload { . $PROFILE }
 
+# Clear profile cache (Oh My Posh and our own) to resolve issues with stale data or after manual edits to cache files. Terminal restart is required to see changes.
 function Clear-ProfileCache {
     $cacheDir = Join-Path $env:LOCALAPPDATA "PowerShellProfile"
-    if (-not (Test-Path $cacheDir)) { Write-Host "No cache directory found." -ForegroundColor Yellow; return }
+    if (-not (Test-Path $cacheDir)) {
+        Clear-OhMyPoshCaches -Quiet
+        Write-Host "No cache directory found." -ForegroundColor Yellow
+        return
+    }
     $items = Get-ChildItem $cacheDir -Exclude "user-settings.json" -ErrorAction SilentlyContinue
-    if (-not $items) { Write-Host "Cache is already clean." -ForegroundColor Green; return }
+    if (-not $items) {
+        Clear-OhMyPoshCaches -Quiet
+        Write-Host "Cache is already clean." -ForegroundColor Green
+        return
+    }
     foreach ($item in $items) {
         Remove-Item $item.FullName -Force -ErrorAction SilentlyContinue
         Write-Host "  Removed $($item.Name)" -ForegroundColor DarkGray
     }
+    Clear-OhMyPoshCaches -Quiet
     Restart-TerminalToApply -Message "Profile cache cleared. Restarting terminal..."
 }
 
+# Uninstall profile components with granular options. By default, only non-user data caches and PSFzf module are removed to allow for quick resets without data loss.
+# Use -All to remove everything including user settings and fonts. Windows Terminal settings are handled in a way to allow easy restoration of previous state if not doing a hard reset.
 function Uninstall-Profile {
     [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
     param(
@@ -1628,7 +1820,7 @@ function Uninstall-Profile {
     if (Test-Path (Split-Path $wtSettingsPath)) {
         $wtLocalState = Split-Path $wtSettingsPath
         $backups = Get-ChildItem -Path $wtLocalState -Filter 'settings.json.*.bak' -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending
+        Sort-Object LastWriteTime -Descending
 
         if ($HardResetWindowsTerminal) {
             if (Test-Path $wtSettingsPath) {
@@ -1666,7 +1858,7 @@ function Uninstall-Profile {
         $excludes = @()
         if (-not $RemoveUserData) { $excludes += 'user-settings.json'; $excludes += 'profile_user.ps1' }
         $cacheItems = Get-ChildItem $cacheDir -ErrorAction SilentlyContinue |
-            Where-Object { $excludes -notcontains $_.Name }
+        Where-Object { $excludes -notcontains $_.Name }
         foreach ($item in $cacheItems) {
             if ($PSCmdlet.ShouldProcess($item.FullName, 'Remove cache file')) {
                 Remove-Item $item.FullName -Force -Recurse -ErrorAction SilentlyContinue
@@ -1682,6 +1874,7 @@ function Uninstall-Profile {
             }
         }
     }
+    Clear-OhMyPoshCaches -Quiet
 
     # Phase 3: Uninstall PSFzf module
     # Note: In CI/sandbox runs (env:CI/AGENT_ID), we skip uninstalling PSFzf to avoid
@@ -1743,14 +1936,28 @@ function Uninstall-Profile {
 
     # Phase 4: Winget tools (opt-in)
     if ($RemoveTools -and (Get-Command winget -ErrorAction SilentlyContinue)) {
-        foreach ($tool in $script:ProfileTools) {
-            if (Get-Command $tool.Cmd -ErrorAction SilentlyContinue) {
-                if ($PSCmdlet.ShouldProcess($tool.Name, 'Uninstall via winget')) {
-                    try {
-                        winget uninstall --id $tool.Id --silent 2>$null
-                        Write-Host "  Uninstalled $($tool.Name)" -ForegroundColor Green
+        if ($isCiOrAgent) {
+            Write-Host '  Skipping managed tool uninstall under CI/agent environment.' -ForegroundColor DarkGray
+        }
+        else {
+            foreach ($tool in $script:ProfileTools) {
+                if (Get-Command $tool.Cmd -ErrorAction SilentlyContinue) {
+                    if ($PSCmdlet.ShouldProcess($tool.Name, 'Uninstall via winget')) {
+                        try {
+                            $wingetOutput = @(& winget uninstall -e --id $tool.Id --silent 2>&1)
+                            if ($LASTEXITCODE -eq 0) {
+                                Write-Host "  Uninstalled $($tool.Name)" -ForegroundColor Green
+                            }
+                            else {
+                                $wingetMessage = (@($wingetOutput) -join ' ').Trim()
+                                if (-not $wingetMessage) { $wingetMessage = 'no diagnostic output' }
+                                Write-Warning "  Failed to uninstall $($tool.Name) (exit $LASTEXITCODE): $wingetMessage"
+                            }
+                        }
+                        catch {
+                            Write-Warning "  Failed to uninstall $($tool.Name): $_"
+                        }
                     }
-                    catch { Write-Warning "  Failed to uninstall $($tool.Name): $_" }
                 }
             }
         }
@@ -1859,8 +2066,10 @@ function Uninstall-Profile {
     Restart-TerminalToApply -Message "Uninstall complete. Restarting terminal..."
 }
 
+# Utility
 function path { $env:PATH -split ';' | Where-Object { $_ } }
 
+# Fetch current weather for a city or based on IP geolocation if no city is provided. Uses wttr.in with a fallback to Open-Meteo if wttr.in is unreachable.
 function weather {
     param([string]$City)
     $encoded = if ($City) { [System.Uri]::EscapeDataString($City) } else { '' }
@@ -1905,6 +2114,7 @@ function weather {
     }
 }
 
+# Retrieve WiFi password for a given SSID or list all known WiFi profiles with their passwords. Uses netsh under the hood, so it only works on Windows and requires appropriate permissions to view passwords.
 function wifipass {
     param([string]$SSID)
     try {
@@ -1935,6 +2145,7 @@ function wifipass {
     catch { Write-Error "Failed to query WiFi profiles: $_" }
 }
 
+# Open hosts file in preferred editor with admin rights. Uses Resolve-PreferredEditor to find the editor executable, and handles both GUI and terminal editors appropriately.
 function hosts {
     $hostsPath = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
     $editor = Resolve-PreferredEditor
@@ -1948,6 +2159,7 @@ function hosts {
     }
 }
 
+# Simple download speed test by fetching a known file from Cloudflare's speed test endpoint and measuring the time taken. Provides a rough estimate of download speed in Mbps.
 function speedtest {
     Write-Host "Testing download speed..." -ForegroundColor Cyan
     $url = "https://speed.cloudflare.com/__down?bytes=25000000"
@@ -1964,6 +2176,7 @@ function speedtest {
     }
 }
 
+# Get size of a file or directory in a human-readable format. For directories, it sums the sizes of all contained files recursively. Handles errors gracefully and formats output with appropriate units.
 function sizeof {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { Write-Error "Path not found: $Path"; return }
@@ -1981,6 +2194,8 @@ function sizeof {
     else { "$size bytes" }
 }
 
+# View recent system and application event logs with a simple command. By default, it shows the 20 most recent events from both System and Application logs, but you can adjust the count with the -Count parameter.
+# The output includes timestamp, log name, level, event ID, and message, formatted in a readable table.
 function eventlog {
     param([ValidateRange(1, 10000)][int]$Count = 20)
     Get-WinEvent -LogName System, Application -MaxEvents $Count -ErrorAction SilentlyContinue |
@@ -1991,6 +2206,7 @@ function eventlog {
 
 # SSH & Remote
 if (Get-Command ssh -ErrorAction SilentlyContinue) {
+    # Copy SSH public key to remote host (ssh-copy-id equivalent)
     function Copy-SshKey {
         param([Parameter(Mandatory)][string]$RemoteHost)
         $keyPath = if (Test-Path "$env:USERPROFILE\.ssh\id_ed25519.pub") { "$env:USERPROFILE\.ssh\id_ed25519.pub" }
@@ -2007,6 +2223,8 @@ if (Get-Command ssh -ErrorAction SilentlyContinue) {
     }
     Set-Alias -Name ssh-copy-key -Value Copy-SshKey
 
+    # Generate a new SSH key pair with ed25519 algorithm. By default, it creates id_ed25519 in the user's .ssh directory, but you can specify a different name with the -Name parameter.
+    # The function checks for existing keys to avoid overwriting and provides feedback on the generated key path.
     function keygen {
         param([string]$Name = 'id_ed25519')
         $keyPath = Join-Path "$env:USERPROFILE\.ssh" $Name
@@ -2014,6 +2232,7 @@ if (Get-Command ssh -ErrorAction SilentlyContinue) {
     }
 }
 
+# Open Remote Desktop Connection to a specified computer. The computer name or IP address is required as a parameter. This function simply wraps the mstsc command for convenience.
 function rdp {
     param([Parameter(Mandatory)][string]$Computer)
     mstsc "/v:$Computer"
@@ -2045,6 +2264,8 @@ function killport {
     else { Write-Warning "No processes were stopped on port $Port." }
 }
 
+# Make HTTP requests with flexible options for method, body, headers, and content type. By default, it performs a GET request and attempts to parse JSON responses for pretty output.
+# It also handles binary responses gracefully and provides error details when requests fail.
 function http {
     param(
         [Parameter(Mandatory)][string]$Url,
@@ -2099,6 +2320,8 @@ function http {
     }
 }
 
+# Pretty-print JSON from a file or pipeline input. If a file path is provided, it reads and formats the JSON content. If JSON is piped in, it formats that instead.
+# It handles errors gracefully and provides usage hints when no input is given.
 function prettyjson {
     param(
         [Parameter(Position = 0)]
@@ -2173,6 +2396,7 @@ function urlencode {
     param([Parameter(Mandatory)][string]$Text)
     [System.Uri]::EscapeDataString($Text)
 }
+# Decode URL-encoded string
 function urldecode {
     param([Parameter(Mandatory)][string]$Text)
     [System.Uri]::UnescapeDataString($Text)
@@ -2212,7 +2436,7 @@ function tlscert {
         $stream = $tcp.GetStream()
         $stream.ReadTimeout = 10000
         $stream.WriteTimeout = 10000
-        $ssl = New-Object System.Net.Security.SslStream($stream, $false, {$true})
+        $ssl = New-Object System.Net.Security.SslStream($stream, $false, { $true })
         $ssl.AuthenticateAsClient($Domain)
         $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($ssl.RemoteCertificate)
         $daysLeft = [math]::Floor(($cert.NotAfter - (Get-Date)).TotalDays)
@@ -2337,10 +2561,10 @@ function whois {
         foreach ($ev in @($rdap.events)) {
             if (-not $ev) { continue }
             $label = switch ($ev.eventAction) {
-                'registration'    { 'Registered' }
-                'expiration'      { 'Expires' }
-                'last changed'    { 'Updated' }
-                default           { $ev.eventAction }
+                'registration' { 'Registered' }
+                'expiration' { 'Expires' }
+                'last changed' { 'Updated' }
+                default { $ev.eventAction }
             }
             if ($label) {
                 $date = ([DateTime]$ev.eventDate).ToString('yyyy-MM-dd')
@@ -2363,6 +2587,7 @@ function whois {
 
 # Clipboard Utilities
 function cpy { if (-not $args) { Write-Error "Usage: cpy <text>"; return }; Set-Clipboard ($args -join ' ') }
+# Paste from clipboard
 function pst { Get-Clipboard }
 
 # Safely insert clipboard text into the prompt buffer (never executes directly)
@@ -2506,156 +2731,77 @@ if (Get-Command dotnet -ErrorAction SilentlyContinue) {
     Register-ArgumentCompleter -Native -CommandName dotnet -ScriptBlock $dotnetScriptblock
 }
 
-# Oh My Posh initialization (interactive only, cached for fast startup)
+# Oh My Posh initialization (interactive only; no init-script caching for maximum reliability)
 if ($isInteractive) {
-    if (Get-Command oh-my-posh -ErrorAction SilentlyContinue) {
-        # Read theme name + URL from cached config; user-settings.json overrides theme.json
+    $ompExecutablePath = Get-OhMyPoshExecutablePath
+    if ($ompExecutablePath) {
+        # Read the selected theme from cached config; user-settings.json can override the theme name.
         $profileConfigPath = Join-Path $cacheDir "theme.json"
         $themeName = $null
-        $themeUrl = $null
         if (Test-Path $profileConfigPath) {
             try {
                 $cfg = Get-Content $profileConfigPath -Raw | ConvertFrom-Json
-                if ($cfg -and $cfg.theme) {
-                    if ($cfg.theme.name) { $themeName = $cfg.theme.name }
-                    if ($cfg.theme.url) { $themeUrl = $cfg.theme.url }
-                }
+                if ($cfg -and $cfg.theme -and $cfg.theme.name) { $themeName = $cfg.theme.name }
             }
             catch { Write-Verbose "Failed to parse theme.json: $_" }
         }
+
         $userSettingsStartup = Join-Path $cacheDir "user-settings.json"
         if (Test-Path $userSettingsStartup) {
             try {
                 $userCfg = Get-Content $userSettingsStartup -Raw | ConvertFrom-Json
-                if ($userCfg -and $userCfg.theme) {
-                    if ($userCfg.theme.name) { $themeName = $userCfg.theme.name }
-                    if ($userCfg.theme.url) { $themeUrl = $userCfg.theme.url }
-                }
+                if ($userCfg -and $userCfg.theme -and $userCfg.theme.name) { $themeName = $userCfg.theme.name }
             }
             catch { Write-Verbose "Failed to parse user-settings.json: $_" }
         }
-        # Recovery: if theme.json is missing (cache cleared or cleaning program), re-download it
+
         if (-not $themeName) {
-            try {
-                $configUrl = "$repo_root/$repo_name/main/theme.json"
-                Invoke-RestMethod -Uri $configUrl -OutFile $profileConfigPath -TimeoutSec 5 -ErrorAction Stop
-                $cfg = Get-Content $profileConfigPath -Raw | ConvertFrom-Json
-                if ($cfg -and $cfg.theme) {
-                    if ($cfg.theme.name) { $themeName = $cfg.theme.name }
-                    if ($cfg.theme.url) { $themeUrl = $cfg.theme.url }
-                }
-            }
-            catch { Write-Verbose "Could not recover theme.json from repo: $_" }
+            Write-Warning "No cached OMP theme is configured. Run Update-Profile or setup.ps1 to restore theme.json."
         }
-        if (-not $themeName) {
-            Write-Verbose "No theme.json found in cache. Run Update-Profile or setup.ps1 to configure the OMP theme."
-        }
+
         $localThemePath = if ($themeName) { Join-Path $cacheDir "$themeName.omp.json" } else { $null }
         if ($localThemePath -and -not (Test-Path $localThemePath)) {
-            # Try migrating from old location (Documents\PowerShell), fall back to download
+            # Only recover from local legacy paths at startup. We intentionally avoid network/theme downloads here.
             $oldThemePath = Join-Path (Split-Path $PROFILE) "$themeName.omp.json"
             if (Test-Path $oldThemePath) {
                 try { Move-Item $oldThemePath $localThemePath -Force -ErrorAction Stop }
                 catch { Write-Warning "Could not migrate theme from Documents: $_" }
             }
-            if (-not (Test-Path $localThemePath) -and $themeUrl) {
-                try {
-                    Invoke-RestMethod -Uri $themeUrl -OutFile $localThemePath -TimeoutSec 10 -ErrorAction Stop
-                    $themeSize = (Get-Item $localThemePath).Length
-                    if ($themeSize -eq 0) { throw "Downloaded theme file is empty" }
-                    $null = Get-Content $localThemePath -Raw | ConvertFrom-Json
-                    Write-Host "Downloaded missing Oh My Posh theme to $localThemePath"
-                }
-                catch {
-                    Write-Warning "Failed to download/validate theme file: $_"
-                    Remove-Item $localThemePath -Force -ErrorAction SilentlyContinue
-                }
-            }
         }
+
         if ($localThemePath -and (Test-Path $localThemePath)) {
-            # Resolve OMP's internal cache directory (used for stale cache cleanup below); non-blocking
-            $ompInternalDir = $null
             try {
-                $ompInternalDir = (Resolve-Path (Join-Path $env:LOCALAPPDATA 'Packages\ohmyposh.cli_*\LocalCache\Local\oh-my-posh') -ErrorAction SilentlyContinue | Select-Object -First 1).Path
-            }
-            catch { Write-Verbose "OMP internal cache path not resolved." }
-            # Cache the OMP init script so we don't shell out every startup.
-            # Header tracks both OMP version AND theme path so a theme switch invalidates the cache.
-            # PERF: Defer `oh-my-posh version` until we know the cache is missing/stale; use timeout to avoid hangs.
-            # When the cache exists, validate using only the theme path portion of the header
-            # (version changes are handled by Update-Tools which deletes the cache on upgrade).
-            $ompCachePath = Join-Path $cacheDir "omp-init.ps1"
-            $cacheValid = $false
-            if (Test-Path $ompCachePath) {
-                try {
-                    $fileSize = (Get-Item $ompCachePath).Length
-                    if ($fileSize -gt 0) {
-                        $cacheContent = Get-Content $ompCachePath -Raw -ErrorAction Stop
-                        $firstLine = ($cacheContent -split "`n", 2)[0]
-                        # Fast check: verify header references correct theme path
-                        # Header format: # OMP_CACHE: <version> | <theme_path> - compare path case-insensitively (Windows)
-                        $headerPath = $null
-                        if ($firstLine -match '^# OMP_CACHE: .+ \| (.+)$') { $headerPath = $Matches[1].Trim() }
-                        $pathMatches = $headerPath -and [string]::Equals($headerPath, $localThemePath, [StringComparison]::OrdinalIgnoreCase)
-                        # Also verify that the OMP internal init file referenced in the cache still exists.
-                        # Cleaning programs (CCleaner, BleachBit) often wipe LocalCache directories,
-                        # deleting OMP's internal init script and breaking the cached redirect.
-                        if ($pathMatches) {
-                            $ompInternalPath = [regex]::Match($cacheContent, "& '([^']+)'").Groups[1].Value
-                            if ($ompInternalPath -and (Test-Path -LiteralPath $ompInternalPath)) {
-                                $cacheValid = $true
-                            }
-                        }
-                    }
-                }
-                catch {
-                    # Locked file, corrupt read, or missing internal path - treat as invalid
-                    $cacheValid = $false
-                }
-                if (-not $cacheValid) {
-                    Remove-Item $ompCachePath -Force -ErrorAction SilentlyContinue
-                    # OMP bakes the theme into its binary cache (omp.cache) during `init --config`.
-                    # When our cache is invalid, clear OMP binary/session caches so regenerated init bakes in the correct theme.
-                    if ($ompInternalDir) {
-                        Remove-Item (Join-Path $ompInternalDir 'omp.cache') -Force -ErrorAction SilentlyContinue
-                        Get-ChildItem $ompInternalDir -Filter 'pwsh.*.omp.cache' -ErrorAction SilentlyContinue |
-                        Remove-Item -Force -ErrorAction SilentlyContinue
-                    }
-                }
-            }
-            if (-not $cacheValid) {
-                # Run with timeout so OMP binary cannot hang the profile (av virus, slow disk, etc.)
-                $ompVersionResult = Invoke-WithTimeout -ScriptBlock { (oh-my-posh version 2>&1 | Out-String).Trim() } -TimeoutSec 10
-                $ompVersion = if ($ompVersionResult) { $ompVersionResult } else { 'unknown' }
-                $initScript = Invoke-WithTimeout -ScriptBlock { param($cfg) oh-my-posh init pwsh --config $cfg } -ArgumentList $localThemePath -TimeoutSec 15
-                if ($initScript) {
-                    $initStr = @($initScript) -join "`n"
-                    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-                    [System.IO.File]::WriteAllText($ompCachePath, ('# OMP_CACHE: {0} | {1}' -f $ompVersion, $localThemePath) + "`n" + $initStr, $utf8NoBom)
-                }
-                else {
-                    if (-not $ompVersionResult) { Write-Warning "oh-my-posh version timed out or failed; using fallback prompt." }
-                    else { Write-Warning "oh-my-posh init timed out or produced no output. Cache not written." }
-                }
-            }
-            try {
-                . $ompCachePath
+                $themeContent = Get-Content $localThemePath -Raw -ErrorAction Stop
+                if ([string]::IsNullOrWhiteSpace($themeContent)) { throw 'Theme file is empty' }
+                $null = $themeContent | ConvertFrom-Json
             }
             catch {
-                Remove-Item $ompCachePath -Force -ErrorAction SilentlyContinue
-                $ompVersionResult = Invoke-WithTimeout -ScriptBlock { (oh-my-posh version 2>&1 | Out-String).Trim() } -TimeoutSec 10
-                $ompVersion = if ($ompVersionResult) { $ompVersionResult } else { 'unknown' }
-                $initScript = Invoke-WithTimeout -ScriptBlock { param($cfg) oh-my-posh init pwsh --config $cfg } -ArgumentList $localThemePath -TimeoutSec 15
-                if ($initScript) {
-                    $initStr = @($initScript) -join "`n"
-                    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-                    [System.IO.File]::WriteAllText($ompCachePath, ('# OMP_CACHE: {0} | {1}' -f $ompVersion, $localThemePath) + "`n" + $initStr, $utf8NoBom)
-                    try { . $ompCachePath } catch { Write-Warning "Failed to initialize oh-my-posh: $_" }
+                Write-Warning "Configured OMP theme is invalid at '$localThemePath': $_"
+                $localThemePath = $null
+            }
+        }
+
+        if ($localThemePath -and (Test-Path $localThemePath)) {
+            Clear-OhMyPoshCaches -Quiet
+            try {
+                $initScript = @((& $ompExecutablePath init pwsh --config $localThemePath) 2>&1)
+                if (-not $initScript) { throw 'oh-my-posh init produced no output' }
+                if ($LASTEXITCODE -ne 0) { throw "oh-my-posh init exited with code $LASTEXITCODE" }
+                $initText = @($initScript) -join "`n"
+                try {
+                    $initBlock = [scriptblock]::Create($initText)
+                    . $initBlock
                 }
-                else {
-                    Write-Warning "Failed to initialize oh-my-posh: $_"
+                catch {
+                    Write-Warning "Failed to initialize oh-my-posh with '$localThemePath': $_"
                 }
             }
+            catch {
+                Write-Warning "Failed to initialize oh-my-posh with '$localThemePath': $_"
+            }
+        }
+        elseif ($themeName) {
+            Write-Warning "Configured OMP theme '$themeName' was not found locally at '$localThemePath'. Run Update-Profile or setup.ps1 to restore it."
         }
     }
     else {
@@ -2665,7 +2811,8 @@ if ($isInteractive) {
 
 # zoxide initialization (interactive only, cached for fast startup)
 if ($isInteractive) {
-    if (Get-Command zoxide -ErrorAction SilentlyContinue) {
+    $zoxideExecutablePath = Get-ExternalCommandPath -CommandName 'zoxide'
+    if ($zoxideExecutablePath) {
         $zoxideCachePath = Join-Path $cacheDir "zoxide-init.ps1"
         # PERF: Defer version/init until cache is missing/stale; use timeout to avoid hangs.
         # When cache exists and is non-empty, trust it (Update-Tools deletes cache on upgrade).
@@ -2682,9 +2829,15 @@ if ($isInteractive) {
             if (-not $cacheValid) { Remove-Item $zoxideCachePath -Force -ErrorAction SilentlyContinue }
         }
         if (-not $cacheValid) {
-            $zoxideVersionResult = Invoke-WithTimeout -ScriptBlock { (zoxide --version 2>$null | Out-String).Trim() } -TimeoutSec 5
+            $zoxideVersionResult = Invoke-WithTimeout -ScriptBlock {
+                param($exePath)
+                (& $exePath --version 2>$null | Out-String).Trim()
+            } -ArgumentList @($zoxideExecutablePath) -TimeoutSec 5
             $zoxideVersion = if ($zoxideVersionResult) { $zoxideVersionResult } else { 'unknown' }
-            $initScript = Invoke-WithTimeout -ScriptBlock { zoxide init --cmd z powershell | Out-String } -TimeoutSec 10
+            $initScript = Invoke-WithTimeout -ScriptBlock {
+                param($exePath)
+                (& $exePath init --cmd z powershell | Out-String)
+            } -ArgumentList @($zoxideExecutablePath) -TimeoutSec 10
             if ($initScript) {
                 $zoxideInitStr = @($initScript) -join "`n"
                 $zoxideHeader = "# ZOXIDE_CACHE_VERSION: $zoxideVersion"
@@ -2700,9 +2853,15 @@ if ($isInteractive) {
         }
         catch {
             Remove-Item $zoxideCachePath -Force -ErrorAction SilentlyContinue
-            $zoxideVersionResult = Invoke-WithTimeout -ScriptBlock { (zoxide --version 2>$null | Out-String).Trim() } -TimeoutSec 5
+            $zoxideVersionResult = Invoke-WithTimeout -ScriptBlock {
+                param($exePath)
+                (& $exePath --version 2>$null | Out-String).Trim()
+            } -ArgumentList @($zoxideExecutablePath) -TimeoutSec 5
             $zoxideVersion = if ($zoxideVersionResult) { $zoxideVersionResult } else { 'unknown' }
-            $initScript = Invoke-WithTimeout -ScriptBlock { zoxide init --cmd z powershell | Out-String } -TimeoutSec 10
+            $initScript = Invoke-WithTimeout -ScriptBlock {
+                param($exePath)
+                (& $exePath init --cmd z powershell | Out-String)
+            } -ArgumentList @($zoxideExecutablePath) -TimeoutSec 10
             if ($initScript) {
                 $zoxideInitStr = @($initScript) -join "`n"
                 $zoxideHeader = "# ZOXIDE_CACHE_VERSION: $zoxideVersion"
@@ -2789,7 +2948,7 @@ ${g}speedtest${r} - Download speed test.
 ${g}wifipass${r} [ssid] - Show saved WiFi passwords.
 ${g}hosts${r} - Open hosts file in elevated editor.
 ${g}Clear-Cache${r} [-IncludeSystemCaches] - Clear user/system caches.
-${g}Clear-ProfileCache${r} - Reset all profile caches (OMP, zoxide, configs).
+${g}Clear-ProfileCache${r} - Reset profile caches plus OMP internal caches.
 ${g}winutil${r} - Launch Chris Titus WinUtil.
 ${g}harden${r} - Open Harden Windows Security.
 
